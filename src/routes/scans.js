@@ -953,28 +953,6 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       historyCount: lotScans.length,
     };
   });
-            deliveryStatus: gateInwardScan.deliveryStatus,
-            deliveredAt: gateInwardScan.deliveredAt,
-            acknowledgedAt: gateInwardScan.acknowledgedAt,
-            acknowledgedByName: gateInwardScan.acknowledgedByName,
-          }
-        : null,
-      supervisorScan: supervisorScan
-        ? {
-            officer: supervisorScan.scannedByName,
-            time: supervisorScan.createdAt,
-            note: supervisorScan.note,
-            status: supervisorScan.status,
-            eventId: supervisorScan.eventId,
-            deliveryStatus: supervisorScan.deliveryStatus,
-            deliveredAt: supervisorScan.deliveredAt,
-            acknowledgedAt: supervisorScan.acknowledgedAt,
-            acknowledgedByName: supervisorScan.acknowledgedByName,
-          }
-        : null,
-      historyCount: lotScans.length,
-    };
-  });
 
   const rgpItems = rgps.map((rgp) => {
     const rgpNo = (rgp.rgpNo || `RGP-${rgp.id}`).toUpperCase();
