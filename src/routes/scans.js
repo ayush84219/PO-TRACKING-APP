@@ -781,7 +781,9 @@ router.get('/tracking-summary', wrap(async (req, res) => {
   try {
     const [p1] = await pool.query(
       `SELECT id, poNumber AS po_number, vendorName AS vendor_name, designName AS design_name,
-              designCategory AS design_category, items, status, date
+              designCategory AS design_category, items, status, date,
+              supervisorName AS supervisor_name, preparedBy AS prepared_by,
+              requisitionRaisedBy AS requisition_raised_by
        FROM purchase_orders ORDER BY id DESC LIMIT 100`
     );
     pos = p1;
@@ -789,7 +791,8 @@ router.get('/tracking-summary', wrap(async (req, res) => {
   if (!pos.length) {
     try {
       const [p2] = await pool.query(
-        `SELECT id, po_number, vendor_name, design_name, items, status, created_at AS date
+        `SELECT id, po_number, vendor_name, design_name, items, status, created_at AS date,
+                supervisor AS supervisor_name
          FROM purchase_orders_app ORDER BY id DESC LIMIT 100`
       );
       pos = p2;
@@ -800,7 +803,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
   try {
     const [r1] = await pool.query(
       `SELECT id, rgpNo, vendor, rgpType, department, purpose, expectedReturnDate,
-              vehicleNo, entries, status, date, createdAt
+              vehicleNo, entries, status, date, createdAt, preparedBy, authorizedBy
        FROM rgp ORDER BY id DESC LIMIT 100`
     );
     rgps = r1;
@@ -839,6 +842,9 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     const gateInwardScan = lotScans.find(
       s => s.scanStage === 'GATE_INWARD' || (s.note && s.note.includes('[GATE ENTRY]')) || s.status === 'pending'
     );
+    const storeScan = lotScans.find(
+      s => s.scanStage === 'STORE_INWARD' || (s.note && s.note.includes('[STORE INWARD]'))
+    );
     const supervisorScan = lotScans.find(
       s => s.scanStage === 'SUPERVISOR_PICKUP' || (s.note && s.note.includes('[SUPERVISOR PICKUP]')) || s.status === 'completed'
     );
@@ -857,17 +863,22 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       currentStage = 'CLOSED';
       statusDisplay = 'Closed';
       progressPercent = 100;
+      currentStep = 3;
+    } else if (lastScan && (lastScan.scanStage === 'STORE_INWARD' || (lastScan.note && lastScan.note.includes('[STORE INWARD]')))) {
+      currentStage = 'AT_STORE';
+      statusDisplay = 'In Store (Awaiting Supervisor)';
+      progressPercent = 66;
       currentStep = 2;
-    } else if (lastScan && lastScan.scanStage === 'GATE_INWARD') {
+    } else if (lastScan && (lastScan.scanStage === 'GATE_INWARD' || (lastScan.note && lastScan.note.includes('[GATE ENTRY]')))) {
       currentStage = 'AT_GATE';
       statusDisplay = lastScan.status === 'pending' ? 'At Gate (Half/Partial)' : 'At Gate (Complete)';
-      progressPercent = lastScan.status === 'pending' ? 30 : 60;
+      progressPercent = 33;
       currentStep = 1;
     } else if (lastScan && lastScan.scanStage === 'SUPERVISOR_PICKUP') {
       currentStage = 'PARTIAL_RECEIVED';
       statusDisplay = 'Half Received';
       progressPercent = 50;
-      currentStep = 1;
+      currentStep = 2;
     }
 
     let totalQty = 0;
@@ -892,10 +903,13 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       vendor: po.vendor_name || 'Vendor',
       designName: po.design_name || '',
       designCategory: po.design_category || '',
+      supervisor: po.supervisor_name || '',
+      supervisorName: po.supervisor_name || '',
+      requestedBy: po.prepared_by ? `${po.prepared_by}${po.requisition_raised_by ? ` (Requisition: ${po.requisition_raised_by})` : ''}` : (po.requisition_raised_by || ''),
       date: po.date,
       status: statusDisplay,
       currentStage,
-      totalStages: 2,
+      totalStages: 3,
       currentStep,
       progressPercent,
       totalQuantity: totalQty || 1,
@@ -908,6 +922,37 @@ router.get('/tracking-summary', wrap(async (req, res) => {
             note: gateInwardScan.note,
             status: gateInwardScan.status,
             eventId: gateInwardScan.eventId,
+            deliveryStatus: gateInwardScan.deliveryStatus,
+            deliveredAt: gateInwardScan.deliveredAt,
+            acknowledgedAt: gateInwardScan.acknowledgedAt,
+            acknowledgedByName: gateInwardScan.acknowledgedByName,
+          }
+        : null,
+      storeScan: storeScan
+        ? {
+            officer: storeScan.scannedByName,
+            time: storeScan.createdAt,
+            note: storeScan.note,
+            status: storeScan.status,
+            eventId: storeScan.eventId,
+          }
+        : null,
+      supervisorScan: supervisorScan
+        ? {
+            officer: supervisorScan.scannedByName,
+            time: supervisorScan.createdAt,
+            note: supervisorScan.note,
+            status: supervisorScan.status,
+            eventId: supervisorScan.eventId,
+            deliveryStatus: supervisorScan.deliveryStatus,
+            deliveredAt: supervisorScan.deliveredAt,
+            acknowledgedAt: supervisorScan.acknowledgedAt,
+            acknowledgedByName: supervisorScan.acknowledgedByName,
+          }
+        : null,
+      historyCount: lotScans.length,
+    };
+  });
             deliveryStatus: gateInwardScan.deliveryStatus,
             deliveredAt: gateInwardScan.deliveredAt,
             acknowledgedAt: gateInwardScan.acknowledgedAt,
