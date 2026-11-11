@@ -16,7 +16,7 @@ router.get('/', wrap(async (req, res) => {
   let params = [];
 
   if (search) {
-    where.push('(po_number LIKE ? OR vendor_name LIKE ? OR design_name LIKE ?)');
+    where.push('(poNumber LIKE ? OR vendorName LIKE ? OR designName LIKE ?)');
     const s = `%${search.trim()}%`;
     params.push(s, s, s);
   }
@@ -26,60 +26,131 @@ router.get('/', wrap(async (req, res) => {
     params.push(status);
   }
 
-  const [items] = await pool.query(
-    `SELECT id, external_id AS externalId, po_number AS poNumber, vendor_name AS vendorName,
-            design_name AS designName, design_category AS designCategory, items,
-            subtotal, tax_rate AS taxRate, tax, total, order_date AS orderDate,
-            delivery_date AS deliveryDate, status, cancellation_reason AS cancellationReason,
-            cancelled_by AS cancelledBy, cancelled_at AS cancelledAt, created_at AS createdAt
-     FROM purchase_orders
-     WHERE ${where.join(' AND ')}
-     ORDER BY id ASC
-     LIMIT ? OFFSET ?`,
-    [...params, l, offset]
-  );
+  let items = [];
+  let count = 0;
 
-  const [[{ count }]] = await pool.query(
-    `SELECT COUNT(*) AS count FROM purchase_orders WHERE ${where.join(' AND ')}`,
-    params
-  );
+  try {
+    const [rows] = await pool.query(
+      `SELECT id, id AS externalId, poNumber, vendorName,
+              designName, designCategory, items,
+              subtotal, taxRate, tax, total, date AS orderDate,
+              deliveryDate, status, cancellation_reason AS cancellationReason,
+              cancelled_by AS cancelledBy, cancelled_at AS cancelledAt,
+              requisitionRaisedBy, preparedBy, approvedBy, remarks, supervisorName
+       FROM purchase_orders
+       WHERE ${where.join(' AND ')}
+       ORDER BY id DESC
+       LIMIT ? OFFSET ?`,
+      [...params, l, offset]
+    );
+    items = rows;
+
+    const [[countRow]] = await pool.query(
+      `SELECT COUNT(*) AS count FROM purchase_orders WHERE ${where.join(' AND ')}`,
+      params
+    );
+    count = countRow?.count || items.length;
+  } catch (err) {
+    // Fallback if legacy snake_case table
+    const [rows] = await pool.query(
+      `SELECT * FROM purchase_orders WHERE 1=1 ORDER BY id DESC LIMIT ? OFFSET ?`,
+      [l, offset]
+    );
+    items = rows;
+    count = items.length;
+  }
 
   res.json({
-    items: items.map(i => ({
-      ...i,
-      items: typeof i.items === 'string' ? JSON.parse(i.items) : (i.items || [])
-    })),
+    items: items.map(i => {
+      let parsedItems = [];
+      try {
+        parsedItems = typeof i.items === 'string' ? JSON.parse(i.items) : (i.items || []);
+      } catch {}
+      return {
+        ...i,
+        poNumber: i.poNumber || i.po_number,
+        vendorName: i.vendorName || i.vendor_name,
+        designName: i.designName || i.design_name,
+        supervisorName: i.supervisorName || i.supervisor_name,
+        requestedBy: i.preparedBy ? `${i.preparedBy}${i.requisitionRaisedBy ? ` (Requisition: ${i.requisitionRaisedBy})` : ''}` : (i.requisitionRaisedBy || ''),
+        items: parsedItems,
+      };
+    }),
     total: count,
     page: p,
     limit: l
   });
 }));
 
-// GET /pos/:poNumber - get single PO by number (e.g. PO-11001 or 11001)
+// GET /pos/:poNumber - get single PO by number (e.g. PO-11001 or 11001 or lot 62115)
 router.get('/:poNumber', wrap(async (req, res) => {
   const raw = req.params.poNumber.trim();
   const poNum = raw.toUpperCase().startsWith('PO-') ? raw : `PO-${raw}`;
+  const digitsOnly = raw.replace(/[^0-9]/g, '');
 
-  const [rows] = await pool.query(
-    `SELECT id, external_id AS externalId, po_number AS poNumber, vendor_name AS vendorName,
-            design_name AS designName, design_category AS designCategory, items,
-            subtotal, tax_rate AS taxRate, tax, total, order_date AS orderDate,
-            delivery_date AS deliveryDate, status, cancellation_reason AS cancellationReason,
-            cancelled_by AS cancelledBy, cancelled_at AS cancelledAt, created_at AS createdAt
-     FROM purchase_orders
-     WHERE po_number = ? OR po_number = ? OR external_id = ?
-     LIMIT 1`,
-    [raw, poNum, raw]
-  );
+  let rows = [];
+
+  // 1. Try camelCase columns (actual production schema)
+  try {
+    const [r1] = await pool.query(
+      `SELECT id, id AS externalId, poNumber, vendorName,
+              designName, designCategory, items,
+              subtotal, taxRate, tax, total, date AS orderDate,
+              deliveryDate, status, cancellation_reason AS cancellationReason,
+              cancelled_by AS cancelledBy, cancelled_at AS cancelledAt,
+              requisitionRaisedBy, preparedBy, approvedBy, remarks, supervisorName
+       FROM purchase_orders
+       WHERE poNumber = ? OR poNumber = ? OR designName = ? OR id = ?
+       LIMIT 1`,
+      [raw, poNum, raw, digitsOnly || -1]
+    );
+    if (r1.length) rows = r1;
+  } catch {}
+
+  // 2. Try generic SELECT *
+  if (!rows.length) {
+    try {
+      const [r2] = await pool.query(
+        `SELECT * FROM purchase_orders
+         WHERE poNumber = ? OR poNumber = ? OR designName = ? OR id = ?
+         LIMIT 1`,
+        [raw, poNum, raw, digitsOnly || -1]
+      );
+      if (r2.length) rows = r2;
+    } catch {}
+  }
+
+  // 3. Try snake_case columns
+  if (!rows.length) {
+    try {
+      const [r3] = await pool.query(
+        `SELECT * FROM purchase_orders
+         WHERE po_number = ? OR po_number = ? OR id = ?
+         LIMIT 1`,
+        [raw, poNum, digitsOnly || -1]
+      );
+      if (r3.length) rows = r3;
+    } catch {}
+  }
 
   if (!rows.length) {
     return res.status(404).json({ error: `Purchase Order '${raw}' not found` });
   }
 
   const po = rows[0];
+  let parsedItems = [];
+  try {
+    parsedItems = typeof po.items === 'string' ? JSON.parse(po.items) : (po.items || []);
+  } catch {}
+
   res.json({
     ...po,
-    items: typeof po.items === 'string' ? JSON.parse(po.items) : (po.items || [])
+    poNumber: po.poNumber || po.po_number || poNum,
+    vendorName: po.vendorName || po.vendor_name || '',
+    designName: po.designName || po.design_name || '',
+    supervisorName: po.supervisorName || po.supervisor_name || '',
+    requestedBy: po.preparedBy ? `${po.preparedBy}${po.requisitionRaisedBy ? ` (Requisition: ${po.requisitionRaisedBy})` : ''}` : (po.requisitionRaisedBy || ''),
+    items: parsedItems,
   });
 }));
 

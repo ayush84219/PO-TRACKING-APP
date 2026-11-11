@@ -211,22 +211,22 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   // =========================================================================
   // 2. CHECK IF LOOKUP IS A PURCHASE ORDER (PO) OR MATERIAL LOT
   // =========================================================================
-  // 1. Check purchase_orders table with po_number (snake_case)
+  // 1. Check purchase_orders table with poNumber & designName (actual live schema)
   let pos = [];
   try {
     const [p1] = await pool.query(
-      'SELECT * FROM purchase_orders WHERE po_number = ? OR po_number = ? OR external_id = ? OR id = ? LIMIT 1',
+      'SELECT * FROM purchase_orders WHERE poNumber = ? OR poNumber = ? OR designName = ? OR id = ? LIMIT 1',
       [cleanPo, rawPo, rawPo, digitsOnly || -1]
     );
     if (p1 && p1.length) pos = p1;
   } catch {}
 
-  // 2. Check purchase_orders table with poNumber (camelCase)
+  // 2. Check purchase_orders table with po_number (snake_case fallback)
   if (!pos.length) {
     try {
       const [p2] = await pool.query(
-        'SELECT * FROM purchase_orders WHERE poNumber = ? OR poNumber = ? OR id = ? LIMIT 1',
-        [cleanPo, rawPo, digitsOnly || -1]
+        'SELECT * FROM purchase_orders WHERE po_number = ? OR po_number = ? OR external_id = ? OR id = ? LIMIT 1',
+        [cleanPo, rawPo, rawPo, digitsOnly || -1]
       );
       if (p2 && p2.length) pos = p2;
     } catch {}
@@ -236,8 +236,8 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   if (!pos.length) {
     try {
       const [p3] = await pool.query(
-        'SELECT * FROM purchase_orders_app WHERE po_number = ? OR po_number = ? OR external_id = ? OR id = ? LIMIT 1',
-        [cleanPo, rawPo, rawPo, digitsOnly || -1]
+        'SELECT * FROM purchase_orders_app WHERE po_number = ? OR po_number = ? OR poNumber = ? OR id = ? LIMIT 1',
+        [cleanPo, rawPo, cleanPo, digitsOnly || -1]
       );
       if (p3 && p3.length) pos = p3;
     } catch {}
@@ -290,17 +290,22 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   let po = null;
   if (rawPoRow) {
     po = {
-      po_number: rawPoRow.po_number || rawPoRow.poNumber || cleanPo,
-      external_id: rawPoRow.external_id || rawPoRow.externalId || rawPoRow.id,
-      vendor_name: rawPoRow.vendor_name || rawPoRow.vendorName || rawPoRow.vendor || rawPoRow.party_name || rawPoRow.supplier_name || rawPoRow.supplier || '',
-      design_name: rawPoRow.design_name || rawPoRow.designName || rawPoRow.material_name || rawPoRow.materialName || rawPoRow.item_name || rawPoRow.style || '',
-      design_category: rawPoRow.design_category || rawPoRow.designCategory || '',
+      po_number: rawPoRow.poNumber || rawPoRow.po_number || cleanPo,
+      external_id: rawPoRow.id,
+      vendor_name: rawPoRow.vendorName || rawPoRow.vendor_name || rawPoRow.vendor || rawPoRow.party_name || rawPoRow.supplier_name || rawPoRow.supplier || '',
+      design_name: rawPoRow.designName || rawPoRow.design_name || rawPoRow.material_name || rawPoRow.materialName || rawPoRow.item_name || rawPoRow.style || '',
+      design_category: rawPoRow.designCategory || rawPoRow.design_category || '',
       items: rawPoRow.items || rawPoRow.entries || null,
       quantity: rawPoRow.quantity || rawPoRow.qty || rawPoRow.total_quantity || rawPoRow.pieces || rawPoRow.total_pieces || null,
       unit: rawPoRow.unit || rawPoRow.uom || 'PCS',
       status: rawPoRow.status || 'Sent to Vendor',
-      date: rawPoRow.order_date || rawPoRow.orderDate || rawPoRow.date || rawPoRow.created_at || null,
-      requested_by: rawPoRow.requested_by || rawPoRow.requestedBy || rawPoRow.prepared_by || rawPoRow.preparedBy || rawPoRow.created_by || rawPoRow.created_by_name || rawPoRow.creator_name || rawPoRow.author || rawPoRow.authorized_by || rawPoRow.authorizedBy || '',
+      date: rawPoRow.date || rawPoRow.orderDate || rawPoRow.order_date || rawPoRow.created_at || null,
+      supervisor: rawPoRow.supervisorName || rawPoRow.supervisor_name || '',
+      supervisorName: rawPoRow.supervisorName || rawPoRow.supervisor_name || '',
+      requested_by: rawPoRow.preparedBy ? `${rawPoRow.preparedBy}${rawPoRow.requisitionRaisedBy ? ` (Requisition: ${rawPoRow.requisitionRaisedBy})` : ''}` : (rawPoRow.requisitionRaisedBy || rawPoRow.requested_by || rawPoRow.requestedBy || ''),
+      preparedBy: rawPoRow.preparedBy || '',
+      requisitionRaisedBy: rawPoRow.requisitionRaisedBy || '',
+      approvedBy: rawPoRow.approvedBy || '',
     };
   }
 
@@ -346,9 +351,10 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     }
 
     const lastScan = scans[scans.length - 1] || null;
-    const hasFinalClosed = scans.some(
+    const finalClosedScan = scans.find(
       s => s.scan_stage === 'SUPERVISOR_PICKUP' && (s.status === 'completed' || (s.note && s.note.includes('FINAL')))
-    );
+    ) || null;
+    const hasFinalClosed = Boolean(finalClosedScan);
 
     let currentStage = 'GENERATED';
     let nextAllowedScan = 'GATE_INWARD';
