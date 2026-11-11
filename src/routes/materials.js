@@ -221,7 +221,18 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     if (p1 && p1.length) pos = p1;
   } catch {}
 
-  // 2. Check purchase_orders table with po_number (snake_case fallback)
+  // 2. If user entered only last 4 digits (or 3+ digits), try suffix match on live purchase_orders
+  if (!pos.length && digitsOnly && digitsOnly.length >= 3) {
+    try {
+      const [pSuffix] = await pool.query(
+        'SELECT * FROM purchase_orders WHERE poNumber LIKE ? OR id LIKE ? ORDER BY id DESC LIMIT 1',
+        [`%${digitsOnly}`, `%${digitsOnly}`]
+      );
+      if (pSuffix && pSuffix.length) pos = pSuffix;
+    } catch {}
+  }
+
+  // 3. Check purchase_orders table with po_number (snake_case fallback)
   if (!pos.length) {
     try {
       const [p2] = await pool.query(
@@ -232,8 +243,41 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     } catch {}
   }
 
-  // 3. Check purchase_orders_app
+  // 4. Check old_purchase_orders table!
+  let oldPos = [];
   if (!pos.length) {
+    try {
+      const [op1] = await pool.query(
+        `SELECT po_number, supplier, order_date, order_time, supervisor,
+                total_amount, status, requisition_raised_by, authorized_by,
+                lot_no, items_json
+         FROM old_purchase_orders
+         WHERE po_number = ? OR po_number = ? OR lot_no LIKE ?
+         LIMIT 1`,
+        [cleanPo, rawPo, `%${digitsOnly || rawPo}%`]
+      );
+      if (op1 && op1.length) oldPos = op1;
+    } catch {}
+
+    // 5. Try suffix match on old_purchase_orders if 3+ digits
+    if (!oldPos.length && digitsOnly && digitsOnly.length >= 3) {
+      try {
+        const [opSuffix] = await pool.query(
+          `SELECT po_number, supplier, order_date, order_time, supervisor,
+                  total_amount, status, requisition_raised_by, authorized_by,
+                  lot_no, items_json
+           FROM old_purchase_orders
+           WHERE po_number LIKE ?
+           ORDER BY po_number DESC LIMIT 1`,
+          [`%${digitsOnly}`]
+        );
+        if (opSuffix && opSuffix.length) oldPos = opSuffix;
+      } catch {}
+    }
+  }
+
+  // 6. Check purchase_orders_app
+  if (!pos.length && !oldPos.length) {
     try {
       const [p3] = await pool.query(
         'SELECT * FROM purchase_orders_app WHERE po_number = ? OR po_number = ? OR poNumber = ? OR id = ? LIMIT 1',
@@ -243,8 +287,8 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     } catch {}
   }
 
-  // 4. Check purchase_order (singular)
-  if (!pos.length) {
+  // 7. Check purchase_order (singular)
+  if (!pos.length && !oldPos.length) {
     try {
       const [p4] = await pool.query(
         'SELECT * FROM purchase_order WHERE po_number = ? OR po_number = ? OR poNumber = ? OR id = ? LIMIT 1',
@@ -284,6 +328,7 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   } catch {}
 
   const rawPoRow = pos[0] || null;
+  const oldPoRow = oldPos[0] || null;
   const sup = sups[0] || null;
   const mat = materials[0] || null;
 
@@ -306,6 +351,38 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
       preparedBy: rawPoRow.preparedBy || '',
       requisitionRaisedBy: rawPoRow.requisitionRaisedBy || '',
       approvedBy: rawPoRow.approvedBy || '',
+      isOldPo: false,
+    };
+  } else if (oldPoRow) {
+    let parsedOldItems = [];
+    try {
+      parsedOldItems = typeof oldPoRow.items_json === 'string' ? JSON.parse(oldPoRow.items_json) : (oldPoRow.items_json || []);
+    } catch {}
+    po = {
+      po_number: oldPoRow.po_number,
+      external_id: oldPoRow.po_number,
+      vendor_name: oldPoRow.supplier || '',
+      design_name: oldPoRow.lot_no || 'Old PO Material',
+      design_category: '',
+      items: Array.isArray(parsedOldItems) ? parsedOldItems.map(it => ({
+        name: it.description || it.department || 'Material Item',
+        qty: Number(it.qty) || 0,
+        unit: (it.uom || 'PCS').toUpperCase(),
+        department: it.department || '',
+        rate: Number(it.rate) || 0,
+        amount: Number(it.amount) || 0,
+      })) : [],
+      quantity: null,
+      unit: 'PCS',
+      status: oldPoRow.status || 'Archived / Old PO',
+      date: oldPoRow.order_date ? `${oldPoRow.order_date} ${oldPoRow.order_time || ''}`.trim() : null,
+      supervisor: oldPoRow.supervisor || '',
+      supervisorName: oldPoRow.supervisor || '',
+      requested_by: oldPoRow.requisition_raised_by ? `${oldPoRow.requisition_raised_by}${oldPoRow.authorized_by ? ` (Auth: ${oldPoRow.authorized_by})` : ''}` : (oldPoRow.authorized_by || ''),
+      preparedBy: oldPoRow.requisition_raised_by || '',
+      requisitionRaisedBy: oldPoRow.requisition_raised_by || '',
+      approvedBy: oldPoRow.authorized_by || '',
+      isOldPo: true,
     };
   }
 
@@ -527,6 +604,7 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
       supervisorScan: supervisorScan || null,
       supervisor: resolvedSupervisor,
       supervisorDetails: sup || null,
+      isOldPo: Boolean(po && po.isOldPo),
     });
   }
 
