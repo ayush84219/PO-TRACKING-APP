@@ -6,6 +6,7 @@ const { initSchema } = require('./db/initSchema');
 const { startQueueWorker, stopQueueWorker } = require('./services/notificationQueue');
 const { startPoWatcher, stopPoWatcher } = require('./services/poWatcher');
 const { initSocket } = require('./services/socketService');
+const { binarySearchService } = require('./services/binarySearchService');
 
 function getLocalIp() {
   const nets = os.networkInterfaces();
@@ -31,6 +32,7 @@ server.listen(port, '0.0.0.0', async () => {
   console.log(`==============================================\n`);
   try {
     await initSchema();
+    binarySearchService.warmup(60000); // Initialize in-memory binary search index (refreshes every 60s)
     startQueueWorker({ intervalMs: 20000, slaMinutes: 15 });
     startPoWatcher(15000);
   } catch (err) {

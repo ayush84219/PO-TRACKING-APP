@@ -2,6 +2,7 @@ const router = require('express').Router();
 const pool = require('../db/pool');
 const { wrap } = require('../middleware/errors');
 const { authenticate } = require('../middleware/auth');
+const { binarySearchService } = require('../services/binarySearchService');
 
 router.use(authenticate);
 
@@ -87,6 +88,19 @@ router.get('/search', wrap(async (req, res) => {
   const q = (req.query.q || req.query.query || '').trim();
   if (!q) {
     return res.json({ matches: [] });
+  }
+
+  // Fast-Path: Use In-Memory Binary Search Index (O(log N) - < 0.1ms)
+  if (binarySearchService.isWarmedUp) {
+    const fastMatches = binarySearchService.searchPos(q, 25);
+    if (fastMatches && fastMatches.length > 0) {
+      return res.json({
+        query: q,
+        count: fastMatches.length,
+        matches: fastMatches,
+        searchMethod: 'binary_search_index',
+      });
+    }
   }
 
   const digitsOnly = q.replace(/[^0-9]/g, '');

@@ -2,19 +2,286 @@ const router = require('express').Router();
 const pool = require('../db/pool');
 const { wrap, AppError } = require('../middleware/errors');
 const { authenticate, requireRole } = require('../middleware/auth');
+const { binarySearchService } = require('../services/binarySearchService');
 
 router.use(authenticate);
+
+// Helper: Look up RGP from live rgp and historical old_rgp tables
+async function lookupRgp(upperLot, digitsOnly) {
+  const rawRgp = upperLot.replace(/^RGP[-/]?/i, '');
+  const rgpSlashVariant = `RGP/${rawRgp}`;
+  const rgpDashVariant = `RGP-${rawRgp}`;
+  const cleanRgp = upperLot.startsWith('RGP-') || upperLot.startsWith('RGP/') ? upperLot : (upperLot.startsWith('RGP') ? upperLot : `RGP-${upperLot}`);
+
+  let rgpRecords = [];
+  let isOldRgpFound = false;
+
+  // Fast-Path: In-memory binary search lookup (O(log N) - < 0.1ms)
+  if (binarySearchService.isWarmedUp) {
+    const fastRgp = binarySearchService.lookupRgp(upperLot);
+    if (fastRgp && fastRgp.data) {
+      rgpRecords = [fastRgp.data];
+      isOldRgpFound = fastRgp.isOldRgp;
+    }
+  }
+
+  // 1. Check live rgp table (only if not found in in-memory binary search index)
+  if (!rgpRecords.length) {
+    try {
+      const [r1] = await pool.query(
+        `SELECT * FROM rgp 
+         WHERE rgpNo IN (?, ?, ?, ?) 
+            OR id = ?
+            ${digitsOnly && digitsOnly.length >= 3 ? 'OR rgpNo LIKE ?' : ''}
+         LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 3
+          ? [upperLot, cleanRgp, rgpDashVariant, rgpSlashVariant, digitsOnly || -1, `%${digitsOnly}`]
+          : [upperLot, cleanRgp, rgpDashVariant, rgpSlashVariant, digitsOnly || -1]
+      );
+      if (r1 && r1.length) rgpRecords = r1;
+    } catch (err) {
+      console.warn('[RGP Lookup] Live rgp error:', err.message);
+    }
+  }
+
+  if (!rgpRecords.length) {
+    try {
+      const [r2] = await pool.query(
+        'SELECT * FROM rgp WHERE rgp_no = ? OR rgp_no = ? OR id = ? LIMIT 1',
+        [cleanRgp, rawRgp, digitsOnly || -1]
+      );
+      if (r2 && r2.length) rgpRecords = r2;
+    } catch {}
+  }
+
+  // 2. Check old_rgp table (1600+ records)
+  if (!rgpRecords.length) {
+    try {
+      const [rOld] = await pool.query(
+        `SELECT * FROM old_rgp 
+         WHERE rgp_no IN (?, ?, ?, ?)
+            ${digitsOnly && digitsOnly.length >= 3 ? 'OR rgp_no LIKE ?' : ''}
+         ORDER BY rgp_no DESC LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 3
+          ? [upperLot, cleanRgp, rgpSlashVariant, rgpDashVariant, `%${digitsOnly}`]
+          : [upperLot, cleanRgp, rgpSlashVariant, rgpDashVariant]
+      );
+      if (rOld && rOld.length) {
+        const oldRow = rOld[0];
+        let parsedEntries = [];
+        try {
+          if (oldRow.items_json) {
+            const parsed = typeof oldRow.items_json === 'string' ? JSON.parse(oldRow.items_json) : oldRow.items_json;
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              parsedEntries = parsed.map(item => ({
+                lotNo: item['Lot No'] || item.lotNo || 'N/A',
+                itemDesc: item['Description'] || item.itemDesc || oldRow.item_description || 'Material',
+                qty1: Number(item['Qty1'] || item.qty1 || item['Qty'] || oldRow.quantity_sent || 1),
+                qty2: Number(item['Qty2'] || item.qty2 || 0),
+                uom: item['UOM'] || item.uom || oldRow.uom || 'PCS',
+                department: item['Department'] || item.department || oldRow.department || '',
+                purpose: item['Purpose'] || item.purpose || oldRow.purpose || '',
+              }));
+            }
+          }
+        } catch {}
+
+        if (!parsedEntries.length) {
+          parsedEntries = [{
+            lotNo: 'N/A',
+            itemDesc: oldRow.item_description || oldRow.purpose || 'Material',
+            qty1: Number(oldRow.quantity_sent) || 1,
+            qty2: 0,
+            uom: oldRow.uom || 'PCS',
+            department: oldRow.department || '',
+            purpose: oldRow.purpose || '',
+          }];
+        }
+
+        rgpRecords = [{
+          id: oldRow.rgp_no,
+          rgpNo: oldRow.rgp_no,
+          date: oldRow.date,
+          vendor: oldRow.vendor,
+          rgpType: oldRow.rgp_type,
+          department: oldRow.department,
+          purpose: oldRow.purpose,
+          expectedReturnDate: oldRow.expected_return_date,
+          vehicleNo: oldRow.vehicle_no || '',
+          preparedBy: oldRow.prepared_by,
+          authorizedBy: oldRow.authorized_by,
+          remarks: oldRow.remarks || '',
+          status: oldRow.status,
+          entries: parsedEntries,
+          isOldRgp: true,
+        }];
+        isOldRgpFound = true;
+      }
+    } catch (err) {
+      console.warn('[RGP Lookup] old_rgp error:', err.message);
+    }
+  }
+
+  if (!rgpRecords.length) {
+    try {
+      const [r3] = await pool.query(
+        'SELECT * FROM rgp_app WHERE rgp_no = ? OR rgp_no = ? OR rgpNo = ? OR id = ? LIMIT 1',
+        [cleanRgp, rawRgp, cleanRgp, digitsOnly || -1]
+      );
+      if (r3 && r3.length) rgpRecords = r3;
+    } catch {}
+  }
+
+  if (!rgpRecords.length) return null;
+
+  const rgp = rgpRecords[0] || null;
+  const rgpNumber = rgp ? (rgp.rgpNo || rgp.rgp_no) : cleanRgp;
+  const cleanRgpDigits = rgpNumber.replace(/[^0-9]/g, '');
+
+  // Query scan history for this RGP from scans_app
+  const [scans] = await pool.query(
+    `SELECT s.id, s.scan_stage, s.status, s.note, s.created_at AS createdAt,
+            s.event_id AS eventId, s.delivery_status AS deliveryStatus,
+            s.delivered_at AS deliveredAt, s.acknowledged_at AS acknowledgedAt,
+            s.acknowledged_by_name AS acknowledgedByName,
+            s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
+     FROM scans_app s
+     LEFT JOIN user_app u ON u.id = s.scanned_by
+     WHERE s.lot_number IN (?, ?, ?, ?, ?, ?) OR s.lot_number = ?
+     ORDER BY s.id ASC`,
+    [rgpNumber, cleanRgpDigits, `RGP-${cleanRgpDigits}`, `RGP/${cleanRgpDigits}`, `PO-${cleanRgpDigits}`, cleanRgp, rgp ? rgp.id : -1]
+  );
+
+  const gateOutScan = scans.find(s => s.scan_stage === 'GATE_OUT' || (s.note && s.note.includes('[GATE OUT]')));
+  const gateInScan = scans.find(s => s.scan_stage === 'GATE_IN' || (s.note && s.note.includes('[GATE IN]')));
+  const supervisorScan = scans.find(s => s.scan_stage === 'SUPERVISOR_INWARD' || (s.note && s.note.includes('[SUPERVISOR INWARD]')));
+
+  // Check if acknowledged in notification_queue_app or scans_app for this RGP
+  if (gateInScan && gateInScan.deliveryStatus !== 'acknowledged') {
+    try {
+      const [ackQ] = await pool.query(
+        `SELECT acknowledged_by_name, acknowledged_at FROM notification_queue_app 
+         WHERE (lot_number IN (?, ?, ?, ?, ?) OR event_id = ?) AND status = 'acknowledged' 
+         ORDER BY id DESC LIMIT 1`,
+        [rgpNumber, cleanRgpDigits, `RGP-${cleanRgpDigits}`, `RGP/${cleanRgpDigits}`, `PO-${cleanRgpDigits}`, gateInScan.eventId || '']
+      );
+      if (ackQ.length) {
+        gateInScan.deliveryStatus = 'acknowledged';
+        gateInScan.acknowledgedByName = ackQ[0].acknowledged_by_name || gateInScan.acknowledgedByName;
+        gateInScan.acknowledgedAt = ackQ[0].acknowledged_at || gateInScan.acknowledgedAt;
+      }
+    } catch {}
+  }
+
+  const lastRgpScan = scans[scans.length - 1] || null;
+  const hasFinalRgpClose = scans.some(
+    s => s.scan_stage === 'SUPERVISOR_INWARD' && (s.status === 'completed' || (s.note && s.note.includes('FINAL')))
+  );
+
+  let currentStage = 'GENERATED';
+  let nextAllowedScan = 'GATE_OUT';
+  let statusDisplay = 'Open';
+
+  if (hasFinalRgpClose) {
+    currentStage = 'CLOSED';
+    nextAllowedScan = null;
+    statusDisplay = 'Closed';
+  } else if (lastRgpScan && lastRgpScan.scan_stage === 'GATE_IN') {
+    currentStage = 'GATE_IN';
+    nextAllowedScan = 'SUPERVISOR_INWARD';
+    statusDisplay = lastRgpScan.status === 'pending' ? 'At Gate (Half/Partial Return)' : 'At Gate (Complete Return)';
+  } else if (lastRgpScan && lastRgpScan.scan_stage === 'GATE_OUT') {
+    currentStage = 'GATE_OUT';
+    nextAllowedScan = 'GATE_IN';
+    statusDisplay = 'Gate Out';
+  } else if (lastRgpScan && lastRgpScan.scan_stage === 'SUPERVISOR_INWARD') {
+    currentStage = 'PARTIAL_RECEIVED';
+    nextAllowedScan = 'GATE_IN';
+    statusDisplay = 'Half Received (Partial Return)';
+  }
+
+  let itemsList = [];
+  let totalQty = 0;
+  let unit = 'PCS';
+
+  if (rgp && rgp.entries) {
+    try {
+      const ents = typeof rgp.entries === 'string' ? JSON.parse(rgp.entries) : rgp.entries;
+      if (Array.isArray(ents)) {
+        itemsList = ents.map(e => ({
+          name: e.itemDesc || `${rgp.rgpType || 'Material'} (${e.lotNo || ''})`,
+          qty: Number(e.qty1) || Number(e.qty2) || 0,
+          unit: e.uom || 'PCS',
+          lotNo: e.lotNo,
+          department: e.department,
+          purpose: e.purpose,
+        }));
+        totalQty = itemsList.reduce((acc, it) => acc + it.qty, 0);
+        if (itemsList[0] && itemsList[0].unit) unit = itemsList[0].unit;
+      }
+    } catch {}
+  }
+
+  let resolvedSupervisor = (rgp && (rgp.authorizedBy || rgp.authorized_by)) || 'Sanjay';
+  if (itemsList.length > 0) {
+    for (const item of itemsList) {
+      if (item.lotNo && item.lotNo !== 'N/A') {
+        const cleanLotNum = item.lotNo.replace(/[^0-9]/g, '');
+        const [supMatch] = await pool.query(
+          'SELECT supervisor FROM supervisor_details_app WHERE lot_number = ? OR lot_number = ? LIMIT 1',
+          [item.lotNo, cleanLotNum]
+        ).catch(() => [[]]);
+        if (supMatch && supMatch.length && supMatch[0].supervisor) {
+          resolvedSupervisor = supMatch[0].supervisor;
+          break;
+        }
+      }
+    }
+  }
+
+  const rgpVendor = rgp ? (rgp.vendor || rgp.vendor_name || rgp.party_name || '') : '';
+  const rgpRequestedBy = rgp ? (rgp.preparedBy || rgp.prepared_by || rgp.authorizedBy || rgp.authorized_by || rgp.requestedBy || rgp.requested_by || rgp.created_by || '') : '';
+  const materialTitle = rgp
+    ? `${rgp.rgpType || 'Material'} (${rgp.purpose || 'RGP'}) - ${rgpVendor}`
+    : `RGP ${rgpNumber}`;
+
+  return {
+    exists: true,
+    docType: 'RGP',
+    rgpNumber,
+    poNumber: null,
+    lotNumber: rgpNumber,
+    materialName: materialTitle,
+    vendor: rgpVendor,
+    supplierName: rgpVendor,
+    requestedBy: rgpRequestedBy,
+    purpose: rgp ? (rgp.purpose || '') : '',
+    department: rgp ? (rgp.department || '') : '',
+    vehicleNo: rgp ? (rgp.vehicleNo || rgp.vehicle_no || '') : '',
+    date: rgp ? (rgp.date || rgp.created_at || null) : null,
+    expectedReturnDate: rgp ? (rgp.expectedReturnDate || rgp.expected_return_date || null) : null,
+    status: statusDisplay,
+    expectedQuantity: totalQty || 1,
+    expectedUnit: unit,
+    items: itemsList,
+    currentStage,
+    nextAllowedScan,
+    isFullyReceived: currentStage === 'CLOSED',
+    isPartialReceived: currentStage === 'PARTIAL_RECEIVED',
+    closedBy: (hasFinalRgpClose && hasFinalRgpClose.scannedByName) || null,
+    closedAt: (hasFinalRgpClose && hasFinalRgpClose.createdAt) || null,
+    scanHistory: scans,
+    gateOutScan: gateOutScan || null,
+    gateInScan: gateInScan || null,
+    supervisorScan: supervisorScan || null,
+    supervisor: resolvedSupervisor,
+    isOldRgp: Boolean(rgp && (rgp.isOldRgp || isOldRgpFound)),
+  };
+}
 
 /**
  * GET /materials/lookup/:lot
  * Universal lookup endpoint for both POs and RGPs.
- * Accurately determines:
- * 1. Document type: 'RGP' or 'PO'
- * 2. Real-time workflow stage:
- *    - PO: GENERATED -> AT_GATE -> CLOSED (2-step scan)
- *    - RGP: GENERATED -> GATE_OUT -> GATE_IN -> CLOSED (3-step scan)
- * 3. Next allowed scan stage
- * 4. Scan history with officer attribution and timestamps
  */
 router.get('/lookup/:lot', wrap(async (req, res) => {
   const lot = (req.params.lot || '').trim();
@@ -28,201 +295,57 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   // =========================================================================
   // 1. CHECK IF LOOKUP IS AN RGP (Returnable Gate Pass)
   // =========================================================================
-  const isExplicitRgp = upperLot.startsWith('RGP-') || upperLot.startsWith('RGP');
+  const isExplicitRgp = upperLot.startsWith('RGP') || upperLot.includes('RGP') || req.query.type === 'rgp' || req.query.docType === 'RGP';
   const isExplicitPo = upperLot.startsWith('PO-') || upperLot.startsWith('PO');
-  let rgpRecords = [];
-  if (isExplicitRgp) {
-    const cleanRgp = upperLot.startsWith('RGP-') ? upperLot : `RGP-${upperLot.replace(/^RGP-?/, '')}`;
-    const rawRgp = cleanRgp.replace(/^RGP-/, '');
-    try {
-      const [r1] = await pool.query(
-        'SELECT * FROM rgp WHERE rgpNo = ? OR rgpNo = ? OR id = ? LIMIT 1',
-        [cleanRgp, rawRgp, digitsOnly || -1]
-      );
-      if (r1.length) rgpRecords = r1;
-    } catch {}
-    if (!rgpRecords.length) {
-      try {
-        const [r2] = await pool.query(
-          'SELECT * FROM rgp WHERE rgp_no = ? OR rgp_no = ? OR id = ? LIMIT 1',
-          [cleanRgp, rawRgp, digitsOnly || -1]
-        );
-        if (r2.length) rgpRecords = r2;
-      } catch {}
-    }
-    if (!rgpRecords.length) {
-      try {
-        const [r3] = await pool.query(
-          'SELECT * FROM rgp_app WHERE rgp_no = ? OR rgp_no = ? OR rgpNo = ? OR id = ? LIMIT 1',
-          [cleanRgp, rawRgp, cleanRgp, digitsOnly || -1]
-        );
-        if (r3.length) rgpRecords = r3;
-      } catch {}
-    }
-  }
 
-  if (isExplicitRgp) {
-    const rgp = rgpRecords[0] || null;
-    const rgpNumber = rgp ? rgp.rgpNo : (upperLot.startsWith('RGP-') ? upperLot : `RGP-${upperLot}`);
+  let pos = [];
+  let oldPos = [];
 
-    const cleanRgpDigits = rgpNumber.replace(/[^0-9]/g, '');
-
-    // Query scan history for this RGP from scans_app
-    const [scans] = await pool.query(
-      `SELECT s.id, s.scan_stage, s.status, s.note, s.created_at AS createdAt,
-              s.event_id AS eventId, s.delivery_status AS deliveryStatus,
-              s.delivered_at AS deliveredAt, s.acknowledged_at AS acknowledgedAt,
-              s.acknowledged_by_name AS acknowledgedByName,
-              s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
-       FROM scans_app s
-       LEFT JOIN user_app u ON u.id = s.scanned_by
-       WHERE s.lot_number IN (?, ?, ?, ?) OR s.lot_number = ?
-       ORDER BY s.id ASC`,
-      [rgpNumber, cleanRgpDigits, `RGP-${cleanRgpDigits}`, `PO-${cleanRgpDigits}`, rgp ? rgp.id : -1]
-    );
-
-    const gateOutScan = scans.find(s => s.scan_stage === 'GATE_OUT' || (s.note && s.note.includes('[GATE OUT]')));
-    const gateInScan = scans.find(s => s.scan_stage === 'GATE_IN' || (s.note && s.note.includes('[GATE IN]')));
-    const supervisorScan = scans.find(s => s.scan_stage === 'SUPERVISOR_INWARD' || (s.note && s.note.includes('[SUPERVISOR INWARD]')));
-
-    // Check if acknowledged in notification_queue_app or scans_app for this RGP
-    if (gateInScan && gateInScan.deliveryStatus !== 'acknowledged') {
-      try {
-        const [ackQ] = await pool.query(
-          `SELECT acknowledged_by_name, acknowledged_at FROM notification_queue_app 
-           WHERE (lot_number IN (?, ?, ?, ?) OR event_id = ?) AND status = 'acknowledged' 
-           ORDER BY id DESC LIMIT 1`,
-          [rgpNumber, cleanRgpDigits, `RGP-${cleanRgpDigits}`, `PO-${cleanRgpDigits}`, gateInScan.eventId || '']
-        );
-        if (ackQ.length) {
-          gateInScan.deliveryStatus = 'acknowledged';
-          gateInScan.acknowledgedByName = ackQ[0].acknowledged_by_name || gateInScan.acknowledgedByName;
-          gateInScan.acknowledgedAt = ackQ[0].acknowledged_at || gateInScan.acknowledgedAt;
+  // Fast-Path: In-memory binary search lookup (O(log N) - < 0.1ms)
+  if (binarySearchService.isWarmedUp) {
+    if (isExplicitRgp) {
+      const rgpResult = await lookupRgp(upperLot, digitsOnly);
+      if (rgpResult) return res.json(rgpResult);
+    } else {
+      // Check PO index first
+      const fastPo = binarySearchService.lookupPo(upperLot);
+      if (fastPo && fastPo.data) {
+        if (fastPo.isOldPo) {
+          oldPos = [fastPo.data];
+        } else {
+          pos = [fastPo.data];
         }
-      } catch {}
-    }
-
-    const lastRgpScan = scans[scans.length - 1] || null;
-    const hasFinalRgpClose = scans.some(
-      s => s.scan_stage === 'SUPERVISOR_INWARD' && (s.status === 'completed' || (s.note && s.note.includes('FINAL')))
-    );
-
-    let currentStage = 'GENERATED';
-    let nextAllowedScan = 'GATE_OUT';
-    let statusDisplay = 'Open';
-
-    if (hasFinalRgpClose) {
-      currentStage = 'CLOSED';
-      nextAllowedScan = null;
-      statusDisplay = 'Closed';
-    } else if (lastRgpScan && lastRgpScan.scan_stage === 'GATE_IN') {
-      currentStage = 'GATE_IN';
-      nextAllowedScan = 'SUPERVISOR_INWARD';
-      statusDisplay = lastRgpScan.status === 'pending' ? 'At Gate (Half/Partial Return)' : 'At Gate (Complete Return)';
-    } else if (lastRgpScan && lastRgpScan.scan_stage === 'GATE_OUT') {
-      currentStage = 'GATE_OUT';
-      nextAllowedScan = 'GATE_IN';
-      statusDisplay = 'Gate Out';
-    } else if (lastRgpScan && lastRgpScan.scan_stage === 'SUPERVISOR_INWARD') {
-      currentStage = 'PARTIAL_RECEIVED';
-      nextAllowedScan = 'GATE_IN';
-      statusDisplay = 'Half Received (Partial Return)';
-    }
-
-    let itemsList = [];
-    let totalQty = 0;
-    let unit = 'PCS';
-
-    if (rgp && rgp.entries) {
-      try {
-        const ents = typeof rgp.entries === 'string' ? JSON.parse(rgp.entries) : rgp.entries;
-        if (Array.isArray(ents)) {
-          itemsList = ents.map(e => ({
-            name: e.itemDesc || `${rgp.rgpType || 'Material'} (${e.lotNo || ''})`,
-            qty: Number(e.qty1) || Number(e.qty2) || 0,
-            unit: e.uom || 'PCS',
-            lotNo: e.lotNo,
-            department: e.department,
-            purpose: e.purpose,
-          }));
-          totalQty = itemsList.reduce((acc, it) => acc + it.qty, 0);
-          if (itemsList[0] && itemsList[0].unit) unit = itemsList[0].unit;
-        }
-      } catch {}
-    }
-
-    // Lookup supervisor from supervisor_details_app based on any lot number inside RGP entries
-    let resolvedSupervisor = 'Sanjay';
-    if (itemsList.length > 0) {
-      for (const item of itemsList) {
-        if (item.lotNo && item.lotNo !== 'N/A') {
-          const cleanLotNum = item.lotNo.replace(/[^0-9]/g, '');
-          const [supMatch] = await pool.query(
-            'SELECT supervisor FROM supervisor_details_app WHERE lot_number = ? OR lot_number = ? LIMIT 1',
-            [item.lotNo, cleanLotNum]
-          ).catch(() => [[]]);
-          if (supMatch && supMatch.length && supMatch[0].supervisor) {
-            resolvedSupervisor = supMatch[0].supervisor;
-            break;
-          }
+      } else {
+        // If not in POs, check if in RGPs via Binary Search
+        const fastRgp = binarySearchService.lookupRgp(upperLot);
+        if (fastRgp) {
+          const rgpResult = await lookupRgp(fastRgp.rgpNumber || upperLot, digitsOnly);
+          if (rgpResult) return res.json(rgpResult);
         }
       }
     }
-
-    const rgpVendor = rgp ? (rgp.vendor || rgp.vendor_name || rgp.party_name || '') : '';
-    const rgpRequestedBy = rgp ? (rgp.preparedBy || rgp.prepared_by || rgp.authorizedBy || rgp.authorized_by || rgp.requestedBy || rgp.requested_by || rgp.created_by || '') : '';
-    const materialTitle = rgp
-      ? `${rgp.rgpType || 'Material'} (${rgp.purpose || 'RGP'}) - ${rgpVendor}`
-      : `RGP ${rgpNumber}`;
-
-    return res.json({
-      exists: true,
-      docType: 'RGP',
-      rgpNumber,
-      poNumber: null,
-      lotNumber: rgpNumber,
-      materialName: materialTitle,
-      vendor: rgpVendor,
-      supplierName: rgpVendor,
-      requestedBy: rgpRequestedBy,
-      purpose: rgp ? (rgp.purpose || '') : '',
-      department: rgp ? (rgp.department || '') : '',
-      vehicleNo: rgp ? (rgp.vehicleNo || rgp.vehicle_no || '') : '',
-      date: rgp ? (rgp.date || rgp.created_at || null) : null,
-      expectedReturnDate: rgp ? (rgp.expectedReturnDate || rgp.expected_return_date || null) : null,
-      status: statusDisplay,
-      expectedQuantity: totalQty || 1,
-      expectedUnit: unit,
-      items: itemsList,
-      currentStage,
-      nextAllowedScan,
-      isFullyReceived: currentStage === 'CLOSED',
-      isPartialReceived: currentStage === 'PARTIAL_RECEIVED',
-      closedBy: (hasFinalRgpClose && hasFinalRgpClose.scannedByName) || null,
-      closedAt: (hasFinalRgpClose && hasFinalRgpClose.createdAt) || null,
-      scanHistory: scans,
-      gateOutScan: gateOutScan || null,
-      gateInScan: gateInScan || null,
-      supervisorScan: supervisorScan || null,
-      supervisor: resolvedSupervisor,
-    });
+  } else if (isExplicitRgp) {
+    const rgpResult = await lookupRgp(upperLot, digitsOnly);
+    if (rgpResult) return res.json(rgpResult);
   }
 
   // =========================================================================
   // 2. CHECK IF LOOKUP IS A PURCHASE ORDER (PO) OR MATERIAL LOT
   // =========================================================================
+
   // 1. Check purchase_orders table with poNumber & designName (actual live schema)
-  let pos = [];
-  try {
-    const [p1] = await pool.query(
-      'SELECT * FROM purchase_orders WHERE poNumber = ? OR poNumber = ? OR designName = ? OR id = ? LIMIT 1',
-      [cleanPo, rawPo, rawPo, digitsOnly || -1]
-    );
-    if (p1 && p1.length) pos = p1;
-  } catch {}
+  if (!pos.length && !oldPos.length && !binarySearchService.isWarmedUp) {
+    try {
+      const [p1] = await pool.query(
+        'SELECT * FROM purchase_orders WHERE poNumber = ? OR poNumber = ? OR designName = ? OR id = ? LIMIT 1',
+        [cleanPo, rawPo, rawPo, digitsOnly || -1]
+      );
+      if (p1 && p1.length) pos = p1;
+    } catch {}
+  }
 
   // 2. If user entered only last 4 digits (or 3+ digits), try suffix match on live purchase_orders
-  if (!pos.length && digitsOnly && digitsOnly.length >= 3) {
+  if (!pos.length && !oldPos.length && digitsOnly && digitsOnly.length >= 3 && !binarySearchService.isWarmedUp) {
     try {
       const [pSuffix] = await pool.query(
         'SELECT * FROM purchase_orders WHERE poNumber LIKE ? OR id LIKE ? ORDER BY id DESC LIMIT 1',
@@ -233,7 +356,7 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   }
 
   // 3. Check purchase_orders table with po_number (snake_case fallback)
-  if (!pos.length) {
+  if (!pos.length && !oldPos.length && !binarySearchService.isWarmedUp) {
     try {
       const [p2] = await pool.query(
         'SELECT * FROM purchase_orders WHERE po_number = ? OR po_number = ? OR external_id = ? OR id = ? LIMIT 1',
@@ -244,8 +367,7 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   }
 
   // 4. Check old_purchase_orders table!
-  let oldPos = [];
-  if (!pos.length) {
+  if (!pos.length && !oldPos.length && !binarySearchService.isWarmedUp) {
     try {
       const [op1] = await pool.query(
         `SELECT po_number, supplier, order_date, order_time, supervisor,
@@ -331,6 +453,12 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   const oldPoRow = oldPos[0] || null;
   const sup = sups[0] || null;
   const mat = materials[0] || null;
+
+  // Fallback: If no PO / old PO found and not an explicit PO, check RGP and old_rgp tables
+  if (!rawPoRow && !oldPoRow && !sup && !mat && !isExplicitPo) {
+    const fallbackRgp = await lookupRgp(upperLot, digitsOnly);
+    if (fallbackRgp) return res.json(fallbackRgp);
+  }
 
   let po = null;
   if (rawPoRow) {
@@ -625,6 +753,117 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     items: [],
     supervisor: 'Sanjay',
   });
+}));
+
+// GET /materials/search-rgp - search both live rgp and old_rgp tables (supports last 4 digits, vendor, description)
+router.get('/search-rgp', wrap(async (req, res) => {
+  const q = (req.query.q || req.query.query || '').trim();
+  if (!q) {
+    return res.json({ matches: [] });
+  }
+
+  // Fast-Path: Use In-Memory Binary Search Index (O(log N) - < 0.1ms)
+  if (binarySearchService.isWarmedUp) {
+    const fastMatches = binarySearchService.searchRgps(q, 25);
+    if (fastMatches && fastMatches.length > 0) {
+      return res.json({
+        query: q,
+        count: fastMatches.length,
+        matches: fastMatches,
+        searchMethod: 'binary_search_index',
+      });
+    }
+  }
+
+  const digitsOnly = q.replace(/[^0-9]/g, '');
+  const searchPattern = `%${q}%`;
+  const digitPattern = digitsOnly ? `%${digitsOnly}` : searchPattern;
+
+  const matches = [];
+  const seenRgpNumbers = new Set();
+
+  // 1. Search live rgp table
+  try {
+    const [liveRows] = await pool.query(
+      `SELECT id, rgpNo, vendor, rgpType, department, purpose, entries, status, date
+       FROM rgp
+       WHERE rgpNo LIKE ? OR rgpNo LIKE ? OR vendor LIKE ? OR purpose LIKE ? OR department LIKE ? OR id LIKE ?
+       ORDER BY id DESC LIMIT 15`,
+      [searchPattern, digitPattern, searchPattern, searchPattern, searchPattern, digitPattern]
+    );
+
+    for (const r of liveRows) {
+      const rNum = (r.rgpNo || `RGP-${r.id}`).toUpperCase();
+      if (rNum && !seenRgpNumbers.has(rNum)) {
+        seenRgpNumbers.add(rNum);
+        let calcQty = 0;
+        let unit = 'PCS';
+        try {
+          const its = typeof r.entries === 'string' ? JSON.parse(r.entries) : (r.entries || []);
+          if (Array.isArray(its) && its.length) {
+            calcQty = its.reduce((acc, it) => acc + (Number(it.qty1) || Number(it.qty2) || 0), 0);
+            if (its[0]?.uom || its[0]?.unit) unit = (its[0].uom || its[0].unit).toUpperCase();
+          }
+        } catch {}
+        matches.push({
+          rgpNumber: rNum,
+          vendor: r.vendor || 'Vendor',
+          purpose: r.purpose || r.rgpType || 'Job Work',
+          department: r.department || '',
+          quantity: calcQty || 1,
+          unit,
+          status: r.status || 'Live',
+          source: 'live',
+        });
+      }
+    }
+  } catch (err) {
+    console.warn('[RGP Search] Live rgp error:', err.message);
+  }
+
+  // 2. Search old_rgp table (1600+ historical entries)
+  try {
+    const [oldRows] = await pool.query(
+      `SELECT rgp_no, vendor, rgp_type, department, purpose, item_description, quantity_sent, uom, status, items_json
+       FROM old_rgp
+       WHERE rgp_no LIKE ? OR rgp_no LIKE ? OR vendor LIKE ? OR purpose LIKE ? OR item_description LIKE ? OR department LIKE ?
+       ORDER BY rgp_no DESC LIMIT 20`,
+      [searchPattern, digitPattern, searchPattern, searchPattern, searchPattern, searchPattern]
+    );
+
+    for (const r of oldRows) {
+      const rNum = (r.rgp_no || '').toUpperCase();
+      if (rNum && !seenRgpNumbers.has(rNum)) {
+        seenRgpNumbers.add(rNum);
+        let calcQty = Number(r.quantity_sent) || 0;
+        let unit = (r.uom || 'PCS').toUpperCase();
+        try {
+          if (r.items_json) {
+            const its = typeof r.items_json === 'string' ? JSON.parse(r.items_json) : r.items_json;
+            if (Array.isArray(its) && its.length) {
+              const sum = its.reduce((acc, it) => acc + (Number(it['Qty1'] || it.qty1 || it.qty || 0)), 0);
+              if (sum > 0) calcQty = sum;
+              if (its[0]?.['UOM'] || its[0]?.uom) unit = (its[0]['UOM'] || its[0].uom).toUpperCase();
+            }
+          }
+        } catch {}
+        matches.push({
+          rgpNumber: rNum,
+          vendor: r.vendor || '',
+          purpose: r.purpose || r.item_description || r.rgp_type || 'Job Work',
+          department: r.department || '',
+          quantity: calcQty || 1,
+          unit,
+          status: r.status || 'Archived / Old RGP',
+          source: 'old',
+        });
+      }
+    }
+  } catch (err) {
+    console.warn('[RGP Search] old_rgp error:', err.message);
+  }
+
+  res.json({ matches });
 }));
 
 // Any logged-in user: get all lot -> supervisor mappings from supervisor_details_app

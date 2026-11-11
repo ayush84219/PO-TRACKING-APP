@@ -12,6 +12,7 @@ const {
   sendSupervisorScanNotification,
   sendGenericScanNotification,
 } = require('../services/socketService');
+const { binarySearchService } = require('../services/binarySearchService');
 
 router.use(authenticate);
 
@@ -68,7 +69,9 @@ router.post('/', wrap(async (req, res) => {
   // Preserve exact lot string for generic lots, normalize POs and RGPs
   let docLot = rawLot;
   if (isRgp) {
-    docLot = upperLot.startsWith('RGP-') ? upperLot : `RGP-${upperLot}`;
+    docLot = (upperLot.startsWith('RGP-') || upperLot.startsWith('RGP/'))
+      ? upperLot
+      : (upperLot.startsWith('RGP') ? upperLot : `RGP-${upperLot}`);
   } else if (upperLot.startsWith('PO-')) {
     docLot = upperLot;
   } else if (/^\d{4,6}$/.test(rawLot)) {
@@ -428,6 +431,7 @@ router.post('/', wrap(async (req, res) => {
     }
 
     await conn.commit();
+    binarySearchService.notifyDataUpdated();
 
     // =========================================================================
     // 6. AUDIT LOG & NOTIFICATIONS
@@ -811,6 +815,70 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     console.error('Error fetching rgp in tracking-summary:', err.message);
   }
 
+  // Also fetch recent entries from old_rgp table
+  try {
+    const [rOld] = await pool.query(
+      `SELECT rgp_no, date, rgp_type, department, vendor, purpose,
+              item_description, quantity_sent, uom, expected_return_date,
+              vehicle_no, authorized_by, prepared_by, status, items_json
+       FROM old_rgp ORDER BY rgp_no DESC LIMIT 60`
+    );
+    const existingRgpNos = new Set(rgps.map(r => (r.rgpNo || '').toUpperCase()));
+    for (const o of rOld) {
+      const oNum = (o.rgp_no || '').toUpperCase();
+      if (!existingRgpNos.has(oNum)) {
+        existingRgpNos.add(oNum);
+        let entries = [];
+        try {
+          if (o.items_json) {
+            const parsed = typeof o.items_json === 'string' ? JSON.parse(o.items_json) : o.items_json;
+            if (Array.isArray(parsed) && parsed.length) {
+              entries = parsed.map(it => ({
+                lotNo: it['Lot No'] || 'N/A',
+                itemDesc: it['Description'] || o.item_description || 'Item',
+                qty1: Number(it['Qty1'] || o.quantity_sent || 1),
+                qty2: Number(it['Qty2'] || 0),
+                uom: it['UOM'] || o.uom || 'PCS',
+                department: it['Department'] || o.department,
+                purpose: it['Purpose'] || o.purpose,
+              }));
+            }
+          }
+        } catch {}
+        if (!entries.length) {
+          entries = [{
+            lotNo: 'N/A',
+            itemDesc: o.item_description || o.purpose || 'Item',
+            qty1: Number(o.quantity_sent) || 1,
+            qty2: 0,
+            uom: o.uom || 'PCS',
+            department: o.department,
+            purpose: o.purpose,
+          }];
+        }
+        rgps.push({
+          id: o.rgp_no,
+          rgpNo: o.rgp_no,
+          vendor: o.vendor,
+          rgpType: o.rgp_type,
+          department: o.department,
+          purpose: o.purpose,
+          expectedReturnDate: o.expected_return_date,
+          vehicleNo: o.vehicle_no || '',
+          entries,
+          status: o.status,
+          date: o.date,
+          createdAt: o.date,
+          preparedBy: o.prepared_by,
+          authorizedBy: o.authorized_by,
+          isOldRgp: true,
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Error fetching old_rgp in tracking-summary:', err.message);
+  }
+
   const [allScans] = await pool.query(
     `SELECT s.id, s.lot_number AS lotNumber, s.scan_stage AS scanStage, s.status, s.note,
             s.event_id AS eventId, s.delivery_status AS deliveryStatus,
@@ -826,10 +894,15 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     if (!scansByLot[key]) scansByLot[key] = [];
     scansByLot[key].push(scan);
 
-    const rawKey = key.replace(/^(PO-|RGP-)/, '');
-    if (rawKey !== key) {
+    const rawKey = key.replace(/^(PO-|RGP[-/]?)/, '');
+    if (rawKey && rawKey !== key) {
       if (!scansByLot[rawKey]) scansByLot[rawKey] = [];
       scansByLot[rawKey].push(scan);
+    }
+    const digitsOnly = key.replace(/[^0-9]/g, '');
+    if (digitsOnly && digitsOnly !== key && digitsOnly !== rawKey) {
+      if (!scansByLot[digitsOnly]) scansByLot[digitsOnly] = [];
+      scansByLot[digitsOnly].push(scan);
     }
   }
 
@@ -956,8 +1029,9 @@ router.get('/tracking-summary', wrap(async (req, res) => {
 
   const rgpItems = rgps.map((rgp) => {
     const rgpNo = (rgp.rgpNo || `RGP-${rgp.id}`).toUpperCase();
-    const rawNum = rgpNo.replace(/^RGP-/, '');
-    const lotScans = scansByLot[rgpNo] || scansByLot[rawNum] || [];
+    const rawNum = rgpNo.replace(/^(RGP[-/]?)/, '');
+    const cleanDigits = rgpNo.replace(/[^0-9]/g, '');
+    const lotScans = scansByLot[rgpNo] || scansByLot[rawNum] || scansByLot[cleanDigits] || [];
 
     const gateOutScan = lotScans.find(s => s.scanStage === 'GATE_OUT' || (s.note && s.note.includes('[GATE OUT]')));
     const gateInScan = lotScans.find(s => s.scanStage === 'GATE_IN' || (s.note && s.note.includes('[GATE IN]')));
@@ -1020,6 +1094,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       vehicleNo: rgp.vehicleNo || '',
       date: rgp.date,
       expectedReturnDate: rgp.expectedReturnDate,
+      isOldRgp: Boolean(rgp.isOldRgp),
       status: currentStage === 'CLOSED' ? 'Closed' : (currentStage === 'GATE_IN' ? 'At Gate' : (currentStage === 'GATE_OUT' ? 'Gate Out' : 'Open')),
       currentStage,
       totalStages: 3,
