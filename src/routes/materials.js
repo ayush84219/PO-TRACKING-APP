@@ -32,16 +32,32 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   const isExplicitPo = upperLot.startsWith('PO-') || upperLot.startsWith('PO');
   let rgpRecords = [];
   if (isExplicitRgp) {
+    const cleanRgp = upperLot.startsWith('RGP-') ? upperLot : `RGP-${upperLot.replace(/^RGP-?/, '')}`;
+    const rawRgp = cleanRgp.replace(/^RGP-/, '');
     try {
-      const cleanRgp = upperLot.startsWith('RGP-') ? upperLot : `RGP-${upperLot.replace(/^RGP-?/, '')}`;
-      const rawRgp = cleanRgp.replace(/^RGP-/, '');
       const [r1] = await pool.query(
-        'SELECT id, rgpNo, date, vendor, rgpType, department, purpose, expectedReturnDate, vehicleNo, preparedBy, authorizedBy, entries, status FROM rgp WHERE rgpNo = ? OR rgpNo = ? LIMIT 1',
-        [cleanRgp, rawRgp]
+        'SELECT * FROM rgp WHERE rgpNo = ? OR rgpNo = ? OR id = ? LIMIT 1',
+        [cleanRgp, rawRgp, digitsOnly || -1]
       );
       if (r1.length) rgpRecords = r1;
-    } catch (err) {
-      console.error('Error querying rgp table:', err.message);
+    } catch {}
+    if (!rgpRecords.length) {
+      try {
+        const [r2] = await pool.query(
+          'SELECT * FROM rgp WHERE rgp_no = ? OR rgp_no = ? OR id = ? LIMIT 1',
+          [cleanRgp, rawRgp, digitsOnly || -1]
+        );
+        if (r2.length) rgpRecords = r2;
+      } catch {}
+    }
+    if (!rgpRecords.length) {
+      try {
+        const [r3] = await pool.query(
+          'SELECT * FROM rgp_app WHERE rgp_no = ? OR rgp_no = ? OR rgpNo = ? OR id = ? LIMIT 1',
+          [cleanRgp, rawRgp, cleanRgp, digitsOnly || -1]
+        );
+        if (r3.length) rgpRecords = r3;
+      } catch {}
     }
   }
 
@@ -153,8 +169,10 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
       }
     }
 
+    const rgpVendor = rgp ? (rgp.vendor || rgp.vendor_name || rgp.party_name || '') : '';
+    const rgpRequestedBy = rgp ? (rgp.preparedBy || rgp.prepared_by || rgp.authorizedBy || rgp.authorized_by || rgp.requestedBy || rgp.requested_by || rgp.created_by || '') : '';
     const materialTitle = rgp
-      ? `${rgp.rgpType || 'Material'} (${rgp.purpose || 'RGP'}) - ${rgp.vendor}`
+      ? `${rgp.rgpType || 'Material'} (${rgp.purpose || 'RGP'}) - ${rgpVendor}`
       : `RGP ${rgpNumber}`;
 
     return res.json({
@@ -164,12 +182,14 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
       poNumber: null,
       lotNumber: rgpNumber,
       materialName: materialTitle,
-      vendor: rgp ? rgp.vendor : '',
-      purpose: rgp ? rgp.purpose : '',
-      department: rgp ? rgp.department : '',
-      vehicleNo: rgp ? rgp.vehicleNo : '',
-      date: rgp ? rgp.date : null,
-      expectedReturnDate: rgp ? rgp.expectedReturnDate : null,
+      vendor: rgpVendor,
+      supplierName: rgpVendor,
+      requestedBy: rgpRequestedBy,
+      purpose: rgp ? (rgp.purpose || '') : '',
+      department: rgp ? (rgp.department || '') : '',
+      vehicleNo: rgp ? (rgp.vehicleNo || rgp.vehicle_no || '') : '',
+      date: rgp ? (rgp.date || rgp.created_at || null) : null,
+      expectedReturnDate: rgp ? (rgp.expectedReturnDate || rgp.expected_return_date || null) : null,
       status: statusDisplay,
       expectedQuantity: totalQty || 1,
       expectedUnit: unit,
@@ -191,32 +211,50 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   // =========================================================================
   // 2. CHECK IF LOOKUP IS A PURCHASE ORDER (PO) OR MATERIAL LOT
   // =========================================================================
-  // Check materials_app table
-  const [materials] = await pool.query(
-    'SELECT id, lot_number AS lotNumber, material_name AS materialName, status FROM materials_app WHERE lot_number = ? OR lot_number = ?',
-    [lot, cleanPo]
-  );
-
-  // Check purchase_orders or purchase_orders_app
+  // 1. Check purchase_orders table with po_number (snake_case)
   let pos = [];
   try {
     const [p1] = await pool.query(
-      'SELECT poNumber AS po_number, id AS external_id, vendorName AS vendor_name, designName AS design_name, designCategory AS design_category, items, status, date FROM purchase_orders WHERE poNumber = ? OR poNumber = ? OR id = ? LIMIT 1',
-      [cleanPo, rawPo, digitsOnly || -1]
+      'SELECT * FROM purchase_orders WHERE po_number = ? OR po_number = ? OR external_id = ? OR id = ? LIMIT 1',
+      [cleanPo, rawPo, rawPo, digitsOnly || -1]
     );
-    if (p1.length) pos = p1;
+    if (p1 && p1.length) pos = p1;
   } catch {}
+
+  // 2. Check purchase_orders table with poNumber (camelCase)
   if (!pos.length) {
     try {
       const [p2] = await pool.query(
-        'SELECT po_number, external_id, vendor_name, design_name, items, status FROM purchase_orders_app WHERE po_number = ? OR po_number = ? OR external_id = ? LIMIT 1',
+        'SELECT * FROM purchase_orders WHERE poNumber = ? OR poNumber = ? OR id = ? LIMIT 1',
         [cleanPo, rawPo, digitsOnly || -1]
       );
-      if (p2.length) pos = p2;
+      if (p2 && p2.length) pos = p2;
     } catch {}
   }
 
-  // Check supervisor_details_app
+  // 3. Check purchase_orders_app
+  if (!pos.length) {
+    try {
+      const [p3] = await pool.query(
+        'SELECT * FROM purchase_orders_app WHERE po_number = ? OR po_number = ? OR external_id = ? OR id = ? LIMIT 1',
+        [cleanPo, rawPo, rawPo, digitsOnly || -1]
+      );
+      if (p3 && p3.length) pos = p3;
+    } catch {}
+  }
+
+  // 4. Check purchase_order (singular)
+  if (!pos.length) {
+    try {
+      const [p4] = await pool.query(
+        'SELECT * FROM purchase_order WHERE po_number = ? OR po_number = ? OR poNumber = ? OR id = ? LIMIT 1',
+        [cleanPo, rawPo, rawPo, digitsOnly || -1]
+      );
+      if (p4 && p4.length) pos = p4;
+    } catch {}
+  }
+
+  // Check supervisor_details_app and supervisor_details
   let sups = [];
   try {
     const [s1] = await pool.query(
@@ -225,10 +263,46 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     );
     if (s1.length) sups = s1;
   } catch {}
+  if (!sups.length) {
+    try {
+      const [s2] = await pool.query(
+        'SELECT * FROM supervisor_details WHERE lot_number = ? OR lot_number = ? OR lot_number = ? OR lot_number = ? LIMIT 1',
+        [lot, rawPo, cleanPo, digitsOnly || -1]
+      );
+      if (s2.length) sups = s2;
+    } catch {}
+  }
 
-  const po = pos[0] || null;
+  // Check materials_app table
+  let materials = [];
+  try {
+    const [m1] = await pool.query(
+      'SELECT id, lot_number AS lotNumber, material_name AS materialName, status FROM materials_app WHERE lot_number = ? OR lot_number = ? OR lot_number = ? LIMIT 1',
+      [lot, cleanPo, rawPo]
+    );
+    if (m1.length) materials = m1;
+  } catch {}
+
+  const rawPoRow = pos[0] || null;
   const sup = sups[0] || null;
   const mat = materials[0] || null;
+
+  let po = null;
+  if (rawPoRow) {
+    po = {
+      po_number: rawPoRow.po_number || rawPoRow.poNumber || cleanPo,
+      external_id: rawPoRow.external_id || rawPoRow.externalId || rawPoRow.id,
+      vendor_name: rawPoRow.vendor_name || rawPoRow.vendorName || rawPoRow.vendor || rawPoRow.party_name || rawPoRow.supplier_name || rawPoRow.supplier || '',
+      design_name: rawPoRow.design_name || rawPoRow.designName || rawPoRow.material_name || rawPoRow.materialName || rawPoRow.item_name || rawPoRow.style || '',
+      design_category: rawPoRow.design_category || rawPoRow.designCategory || '',
+      items: rawPoRow.items || rawPoRow.entries || null,
+      quantity: rawPoRow.quantity || rawPoRow.qty || rawPoRow.total_quantity || rawPoRow.pieces || rawPoRow.total_pieces || null,
+      unit: rawPoRow.unit || rawPoRow.uom || 'PCS',
+      status: rawPoRow.status || 'Sent to Vendor',
+      date: rawPoRow.order_date || rawPoRow.orderDate || rawPoRow.date || rawPoRow.created_at || null,
+      requested_by: rawPoRow.requested_by || rawPoRow.requestedBy || rawPoRow.prepared_by || rawPoRow.preparedBy || rawPoRow.created_by || rawPoRow.created_by_name || rawPoRow.creator_name || rawPoRow.author || rawPoRow.authorized_by || rawPoRow.authorizedBy || '',
+    };
+  }
 
   if (po || sup || mat) {
     const poNumber = po ? po.po_number : cleanPo;
@@ -306,22 +380,65 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
       try {
         const its = typeof po.items === 'string' ? JSON.parse(po.items) : po.items;
         if (Array.isArray(its) && its.length) {
-          itemsList = its;
-          expectedQuantity = its.reduce((acc, it) => acc + (Number(it.qty) || 0), 0);
-          expectedUnit = its[0].unit || 'PCS';
+          itemsList = its.map(it => ({
+            name: it.name || it.item_name || it.material_name || it.design_name || it.description || 'Material Item',
+            qty: Number(it.qty || it.quantity || it.pieces || it.count || 0),
+            unit: (it.unit || it.uom || 'PCS').toUpperCase(),
+            department: it.department || it.dept || '',
+          }));
+          expectedQuantity = itemsList.reduce((acc, it) => acc + (Number(it.qty) || 0), 0);
+          expectedUnit = itemsList[0].unit || 'PCS';
+        } else if (typeof its === 'object' && its !== null) {
+          itemsList = [{
+            name: its.name || its.item_name || its.material_name || po.design_name || 'Material Item',
+            qty: Number(its.qty || its.quantity || its.pieces || 1),
+            unit: (its.unit || its.uom || 'PCS').toUpperCase(),
+            department: its.department || '',
+          }];
+          expectedQuantity = itemsList[0].qty;
+          expectedUnit = itemsList[0].unit;
         }
-      } catch {}
+      } catch {
+        if (typeof po.items === 'string' && po.items.trim()) {
+          const m = po.items.match(/^(.+?)\s*(\d+)\s*(PCS|PIECES|BOX|KG|MTR|METERS?|ROLLS?)?$/i);
+          if (m) {
+            itemsList = [{
+              name: m[1].trim(),
+              qty: Number(m[2]),
+              unit: m[3] ? m[3].toUpperCase() : 'PCS',
+              department: '',
+            }];
+            expectedQuantity = Number(m[2]);
+            expectedUnit = itemsList[0].unit;
+          }
+        }
+      }
+    }
+
+    if (!expectedQuantity && po && po.quantity) {
+      expectedQuantity = Number(po.quantity);
+      expectedUnit = (po.unit || 'PCS').toUpperCase();
     }
 
     if (!expectedQuantity && sup) {
       expectedQuantity = sup.cutting_qty || sup.stitching_issue_qty;
     }
 
+    // If design name is provided (e.g. "iam label") and pieces exist (e.g. 2000), ensure itemsList reflects it
+    if (itemsList.length === 0 && po && po.design_name && expectedQuantity) {
+      itemsList = [{
+        name: po.design_name,
+        qty: expectedQuantity,
+        unit: expectedUnit,
+        department: po.design_category || '',
+      }];
+    }
+
     let matName = '';
     if (po) {
       const parts = [po.design_name, po.vendor_name].filter(Boolean);
       matName = itemsList.length > 0
-        ? `${itemsList.map(i => i.name).join(', ')} - ${po.vendor_name || 'Vendor'}`
+        ? `${itemsList.map(i => `${i.name} (${i.qty} ${i.unit})`).join(', ')} - ${po.vendor_name || 'Vendor'}`
         : (parts.length ? parts.join(' - ') : `Purchase Order ${poNumber}`);
     } else if (sup) {
       const parts = [sup.garment_type, sup.style, sup.brand ? `[${sup.brand}]` : '', sup.fabric].filter(Boolean);
@@ -356,6 +473,10 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     }
     if (!resolvedSupervisor) resolvedSupervisor = 'Sanjay';
 
+    const resolvedVendor = po ? po.vendor_name : (sup ? (sup.brand || sup.party_name) : '');
+    const resolvedRequestedBy = po ? po.requested_by : '';
+    const resolvedDesign = po ? po.design_name : (sup ? sup.style : '');
+
     return res.json({
       exists: true,
       docType: 'PO',
@@ -363,8 +484,11 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
       rgpNumber: null, // Distinct: PO does NOT have an RGP number
       lotNumber: poNumber,
       materialName: matName,
-      vendor: po ? po.vendor_name : (sup ? sup.brand : ''),
-      designName: po ? po.design_name : (sup ? sup.style : ''),
+      vendor: resolvedVendor,
+      supplierName: resolvedVendor,
+      designName: resolvedDesign,
+      requestedBy: resolvedRequestedBy,
+      date: po ? po.date : null,
       status: statusDisplay,
       expectedQuantity: expectedQuantity || 1,
       expectedUnit,
@@ -384,7 +508,23 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
     });
   }
 
-  return res.json({ exists: false });
+  return res.json({
+    exists: false,
+    docType: isExplicitRgp ? 'RGP' : 'PO',
+    poNumber: isExplicitRgp ? null : cleanPo,
+    rgpNumber: isExplicitRgp ? (upperLot.startsWith('RGP-') ? upperLot : `RGP-${upperLot}`) : null,
+    lotNumber: cleanPo,
+    materialName: `Lot ${cleanPo}`,
+    vendor: '',
+    supplierName: '',
+    designName: '',
+    requestedBy: '',
+    status: 'New',
+    expectedQuantity: 1,
+    expectedUnit: 'BOX',
+    items: [],
+    supervisor: 'Sanjay',
+  });
 }));
 
 // Any logged-in user: get all lot -> supervisor mappings from supervisor_details_app
