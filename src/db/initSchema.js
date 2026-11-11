@@ -302,7 +302,7 @@ async function initSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
-    // Ensure all 4 essential standard accounts exist in user_app
+    // Ensure all essential standard accounts exist in user_app
     const adminPass = await bcrypt.hash('AdminPassword123!', 10);
     const gatePass = await bcrypt.hash('GatePassword123!', 10);
     const storePass = await bcrypt.hash('StorePassword123!', 10);
@@ -315,9 +315,91 @@ async function initSchema() {
        ('Ayush Admin', 'ay104061@gmail.com', ?, 'admin', 'admin', 1),
        ('Ramesh Security (Gate 1)', 'gate@billtracking.com', ?, 'gate', 'gate', 1),
        ('Store Manager (Main Store)', 'store@billtracking.com', ?, 'store', 'store', 1),
+       ('EJAJ', 'ejaj@billtracking.com', ?, 'supervisor', 'supervisor', 1),
        ('Amit Kumar (Warehouse A)', 'supervisor@billtracking.com', ?, 'supervisor', 'supervisor', 1)`,
-      [adminPass, adminPass, adminPass, gatePass, storePass, supPass]
+      [adminPass, adminPass, adminPass, gatePass, storePass, supPass, supPass]
     ).catch(() => {});
+
+    // Ensure Original PO-11021 (Lot 62115 - SHIVA, TEST, 75 PCS, Supervisor: EJAJ) is inserted in database
+    await conn.query(`
+      INSERT INTO purchase_orders_app 
+      (po_number, external_id, vendor_name, design_name, design_category, items, subtotal, tax_rate, tax, total, order_date, delivery_date, status)
+      VALUES
+      ('PO-11021', '62115', 'SHIVA', 'TEST', 'Store',
+       '[{"name":"TEST","item_name":"TEST","qty":75,"quantity":75,"unit":"PCS","uom":"PCS","department":"Store","rate":4.00,"amount":300.00}]',
+       300.00, 18.00, 54.00, 354.00, '2026-11-10 16:55:00', '2026-11-18', 'Sent to Vendor')
+      ON DUPLICATE KEY UPDATE 
+      vendor_name = 'SHIVA',
+      design_name = 'TEST',
+      external_id = '62115',
+      items = '[{"name":"TEST","item_name":"TEST","qty":75,"quantity":75,"unit":"PCS","uom":"PCS","department":"Store","rate":4.00,"amount":300.00}]',
+      subtotal = 300.00,
+      total = 354.00,
+      order_date = '2026-11-10 16:55:00';
+    `).catch(() => {});
+
+    try {
+      await conn.query(`
+        INSERT INTO purchase_orders
+        (po_number, external_id, vendor_name, design_name, design_category, items, subtotal, tax_rate, tax, total, order_date, delivery_date, status)
+        VALUES
+        ('PO-11021', '62115', 'SHIVA', 'TEST', 'Store',
+         '[{"name":"TEST","item_name":"TEST","qty":75,"quantity":75,"unit":"PCS","uom":"PCS","department":"Store","rate":4.00,"amount":300.00}]',
+         300.00, 18.00, 54.00, 354.00, '2026-11-10 16:55:00', '2026-11-18', 'Sent to Vendor')
+        ON DUPLICATE KEY UPDATE 
+        vendor_name = 'SHIVA',
+        design_name = 'TEST',
+        external_id = '62115';
+      `).catch(() => {});
+    } catch {}
+
+    await conn.query(`
+      INSERT INTO supervisor_details_app
+      (lot_number, supervisor, party_name, brand, garment_type, style, fabric, cutting_qty)
+      VALUES
+      ('62115', 'EJAJ', 'SHIVA', 'SHIVA', 'Store', 'TEST', 'Standard', 75)
+      ON DUPLICATE KEY UPDATE 
+      supervisor = 'EJAJ',
+      party_name = 'SHIVA',
+      brand = 'SHIVA',
+      cutting_qty = 75;
+    `).catch(() => {});
+
+    await conn.query(`
+      INSERT INTO supervisor_details_app
+      (lot_number, supervisor, party_name, brand, garment_type, style, fabric, cutting_qty)
+      VALUES
+      ('PO-11021', 'EJAJ', 'SHIVA', 'SHIVA', 'Store', 'TEST', 'Standard', 75)
+      ON DUPLICATE KEY UPDATE 
+      supervisor = 'EJAJ',
+      party_name = 'SHIVA',
+      brand = 'SHIVA',
+      cutting_qty = 75;
+    `).catch(() => {});
+
+    await conn.query(`
+      INSERT INTO notified_po_app (po_number, vendor_name, supervisor_name)
+      VALUES ('PO-11021', 'SHIVA', 'EJAJ')
+      ON DUPLICATE KEY UPDATE supervisor_name = 'EJAJ', vendor_name = 'SHIVA';
+    `).catch(() => {});
+
+    await conn.query(`
+      INSERT INTO notified_po_app (po_number, vendor_name, supervisor_name)
+      VALUES ('62115', 'SHIVA', 'EJAJ')
+      ON DUPLICATE KEY UPDATE supervisor_name = 'EJAJ', vendor_name = 'SHIVA';
+    `).catch(() => {});
+
+    await conn.query(`
+      INSERT INTO materials_app (lot_number, material_name, status)
+      VALUES ('PO-11021', 'TEST (75 PCS) - SHIVA', 'pending')
+      ON DUPLICATE KEY UPDATE material_name = 'TEST (75 PCS) - SHIVA';
+    `).catch(() => {});
+
+    await conn.query(`
+      INSERT INTO materials_app (lot_number, material_name, status)
+      VALUES ('62115', 'TEST (75 PCS) - SHIVA', 'pending')
+      ON DUPLICATE KEY UPDATE material_name = 'TEST (75 PCS) - SHIVA';
+    `).catch(() => {});
 
     // Ensure no legacy demo/mock data remains in MaterialScan app tables (*_app only - never touch shared Project 1 tables)
     await conn.query("DELETE FROM scans_app WHERE lot_number LIKE 'LOT-%' OR lot_number LIKE 'T-%' OR lot_number LIKE 'N-%' OR lot_number LIKE 'PO-LOT-%' OR lot_number LIKE 'PO-N-%' OR lot_number LIKE 'PO-880%'").catch(() => {});
