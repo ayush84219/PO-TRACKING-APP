@@ -32,9 +32,9 @@ server.listen(port, '0.0.0.0', async () => {
   console.log(`==============================================\n`);
   try {
     await initSchema();
-    binarySearchService.warmup(60000); // Initialize in-memory binary search index (refreshes every 60s)
-    startQueueWorker({ intervalMs: 20000, slaMinutes: 15 });
-    startPoWatcher(15000);
+    binarySearchService.warmup(300000); // 5 min refresh for live tables (historical cached in RAM)
+    startQueueWorker({ intervalMs: 30000, slaMinutes: 15 }); // 30s tick
+    startPoWatcher(45000); // 45s tick
   } catch (err) {
     console.error('[Startup Warning] Schema init or worker start failed:', err.message);
   }

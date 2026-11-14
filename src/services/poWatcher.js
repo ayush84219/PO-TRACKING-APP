@@ -20,17 +20,7 @@ async function checkNewPurchaseOrders() {
   const detectedPOs = [];
 
   try {
-    // 1. Ensure notified_po_app table exists with matching collation
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS notified_po_app (
-        po_number VARCHAR(100) COLLATE utf8mb4_0900_ai_ci PRIMARY KEY,
-        vendor_name VARCHAR(150) NULL,
-        supervisor_name VARCHAR(100) NULL,
-        notified_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-    `);
-
-    // 2. Query newly generated POs not yet notified
+    // Query newly generated POs not yet notified using primary key index
     let newPOs = [];
     try {
       const [rows] = await pool.query(`
@@ -38,11 +28,7 @@ async function checkNewPurchaseOrders() {
                p.designName AS design_name, p.designCategory AS design_category,
                p.items, p.date
         FROM purchase_orders p
-        LEFT JOIN notified_po_app n
-          ON (n.po_number = p.poNumber
-              OR n.po_number = CONCAT(_utf8mb4'PO-' COLLATE utf8mb4_0900_ai_ci, p.poNumber)
-              OR n.po_number = CAST(p.id AS CHAR) COLLATE utf8mb4_0900_ai_ci)
-        WHERE n.po_number IS NULL
+        WHERE p.poNumber NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
         ORDER BY p.id ASC
         LIMIT 10
       `);
@@ -210,14 +196,14 @@ async function checkNewPurchaseOrders() {
 }
 
 /**
- * Start periodic PO watcher (checks every 5 seconds)
+ * Start periodic PO watcher (checks every 45 seconds to reduce database CPU/RAM)
  */
-function startPoWatcher(intervalMs = 5000) {
+function startPoWatcher(intervalMs = 45000) {
   if (watcherTimer) return;
-  // Run first check 1.5 seconds after startup
+  // Run first check 3 seconds after startup
   setTimeout(() => {
     checkNewPurchaseOrders();
-  }, 1500);
+  }, 3000);
   watcherTimer = setInterval(checkNewPurchaseOrders, intervalMs);
   console.log(`[POWatcher] Background watcher started (check interval: ${intervalMs}ms).`);
 }

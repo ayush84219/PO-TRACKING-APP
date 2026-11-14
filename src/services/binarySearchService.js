@@ -25,6 +25,11 @@ class BinarySearchService {
     this.rgpsByPrefix = [];       // Sorted by rgpNumber for O(log N) prefix search
     this.rgpsBySuffix = [];       // Sorted by 4-digit / numeric suffix for O(log N) suffix search
     this.rgpsByVendor = [];       // Sorted by vendor for O(log N) vendor search
+
+    // Memory & Bandwidth Optimization: Cache static historical tables in RAM
+    this.cachedOldPos = null;
+    this.cachedOldRgps = null;
+    this.lastOldDataRefresh = 0;
   }
 
   // =========================================================================
@@ -129,14 +134,17 @@ class BinarySearchService {
   // INDEX BUILDER & DATA REFRESH
   // =========================================================================
 
-  async refreshIndex() {
+  async refreshIndex(forceOld = false) {
     if (this.isRefreshing) return;
     this.isRefreshing = true;
     const startTime = Date.now();
 
     try {
-      // 1. Fetch live and old POs in parallel
-      const [pLive, pOld, rLive, rOld] = await Promise.all([
+      const now = Date.now();
+      const needOldRefresh = forceOld || !this.cachedOldPos || !this.cachedOldRgps || (now - this.lastOldDataRefresh > 12 * 3600 * 1000);
+
+      // Fetch live POs & RGPs every cycle; fetch historical archives only once on boot or every 12h
+      const queries = [
         pool.query(`
           SELECT id, poNumber, vendorName, designName, designCategory, items, status, date,
                  supervisorName, preparedBy, requisitionRaisedBy, approvedBy
@@ -144,24 +152,41 @@ class BinarySearchService {
         `).then(res => res[0]).catch(() => []),
 
         pool.query(`
-          SELECT po_number, supplier, order_date, supervisor, lot_no, items_json, status,
-                 requisition_raised_by, authorized_by, total_amount
-          FROM old_purchase_orders
-        `).then(res => res[0]).catch(() => []),
-
-        pool.query(`
           SELECT id, rgpNo, vendor, rgpType, department, purpose, entries, status, date,
                  expectedReturnDate, vehicleNo, preparedBy, authorizedBy
           FROM rgp
         `).then(res => res[0]).catch(() => []),
+      ];
 
-        pool.query(`
-          SELECT rgp_no, date, rgp_type, department, vendor, purpose, item_description,
-                 quantity_sent, uom, expected_return_date, vehicle_no, authorized_by,
-                 prepared_by, status, items_json
-          FROM old_rgp
-        `).then(res => res[0]).catch(() => []),
-      ]);
+      if (needOldRefresh) {
+        queries.push(
+          pool.query(`
+            SELECT po_number, supplier, order_date, supervisor, lot_no, items_json, status,
+                   requisition_raised_by, authorized_by, total_amount
+            FROM old_purchase_orders
+          `).then(res => res[0]).catch(() => []),
+
+          pool.query(`
+            SELECT rgp_no, date, rgp_type, department, vendor, purpose, item_description,
+                   quantity_sent, uom, expected_return_date, vehicle_no, authorized_by,
+                   prepared_by, status, items_json
+            FROM old_rgp
+          `).then(res => res[0]).catch(() => [])
+        );
+      }
+
+      const results = await Promise.all(queries);
+      const pLive = results[0];
+      const rLive = results[1];
+
+      if (needOldRefresh) {
+        this.cachedOldPos = results[2] || [];
+        this.cachedOldRgps = results[3] || [];
+        this.lastOldDataRefresh = now;
+      }
+
+      const pOld = this.cachedOldPos || [];
+      const rOld = this.cachedOldRgps || [];
 
       // --- Build PO Indexes ---
       const newPosByExact = new Map();
@@ -523,11 +548,11 @@ class BinarySearchService {
   // LIFECYCLE
   // =========================================================================
 
-  warmup(intervalMs = 60000) {
-    this.refreshIndex();
+  warmup(intervalMs = 300000) {
+    this.refreshIndex(true); // Load complete index including archives on boot
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     this.refreshTimer = setInterval(() => {
-      this.refreshIndex();
+      this.refreshIndex(false); // Periodic lightweight refresh (only live tables)
     }, intervalMs);
   }
 
