@@ -334,9 +334,14 @@ async function sendFcmPush(userIds, title, message, data = {}) {
   return { sent: sentCount, failed: failedCount };
 }
 
+function isFirebaseReady() {
+  return !!(firebaseInitialized && messaging);
+}
+
 module.exports = {
   registerFcmToken,
   getTokensForUsers,
   sendFcmPush,
+  isFirebaseReady,
 };
 

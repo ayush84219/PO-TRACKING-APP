@@ -13,6 +13,18 @@ const {
 const { logAudit } = require('../services/auditLogger');
 const { notifyStatusChange, sendGateScanNotification, getIO } = require('../services/socketService');
 const S = require('../validators/schemas');
+const { isFirebaseReady } = require('../services/fcmPush');
+
+/**
+ * Public health & FCM readiness diagnostic endpoint
+ */
+router.get('/fcm-status', (req, res) => {
+  res.json({
+    ok: true,
+    firebaseReady: isFirebaseReady(),
+    serverTime: new Date().toISOString(),
+  });
+});
 
 router.use(authenticate);
 
