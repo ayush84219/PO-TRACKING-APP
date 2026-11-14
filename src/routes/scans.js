@@ -550,6 +550,7 @@ router.post('/', wrap(async (req, res) => {
         supplierName: poVendor,
         materialDetails: materialName || 'Material Lot',
         scannerName: me.name,
+        scannerId: me.id,
         scanTime: new Date().toISOString(),
         billId: materialId,
         title: notifTitle,
@@ -568,7 +569,9 @@ router.post('/', wrap(async (req, res) => {
       );
 
       const recipientMap = new Map();
-      [...stores, ...sups, ...allAdmins].forEach(u => recipientMap.set(u.id, u));
+      [...stores, ...sups, ...allAdmins].forEach(u => {
+        if (u.id !== me.id) recipientMap.set(u.id, u);
+      });
       const targets = Array.from(recipientMap.values());
 
       for (const target of targets) {
@@ -612,6 +615,7 @@ router.post('/', wrap(async (req, res) => {
         supplierName: poVendor,
         materialDetails: materialName || 'Material Lot',
         scannerName: me.name,
+        scannerId: me.id,
         scanTime: new Date().toISOString(),
         billId: materialId,
         gateOfficerName: lastScan ? lastScan.scannedByName : 'Gate Officer',
@@ -630,7 +634,9 @@ router.post('/', wrap(async (req, res) => {
       );
 
       const recipientMap = new Map();
-      [...sups, ...gates, ...allAdmins].forEach(u => recipientMap.set(u.id, u));
+      [...sups, ...gates, ...allAdmins].forEach(u => {
+        if (u.id !== me.id) recipientMap.set(u.id, u);
+      });
       const targets = Array.from(recipientMap.values());
 
       for (const target of targets) {
@@ -687,6 +693,7 @@ router.post('/', wrap(async (req, res) => {
         eventId,
         billNumber: docLot,
         scannerName: me.name,
+        scannerId: me.id,
         scanTime: new Date().toISOString(),
         isClosed: !isPartialReceipt,
         materialDetails: materialName,
@@ -705,7 +712,9 @@ router.post('/', wrap(async (req, res) => {
       );
 
       const recipientMap = new Map();
-      [...gates, ...stores, ...allAdmins].forEach(u => recipientMap.set(u.id, u));
+      [...gates, ...stores, ...allAdmins].forEach(u => {
+        if (u.id !== me.id) recipientMap.set(u.id, u);
+      });
       const targets = Array.from(recipientMap.values());
 
       for (const target of targets) {
