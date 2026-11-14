@@ -112,7 +112,19 @@ const FCM_LEGACY_URL = 'https://fcm.googleapis.com/fcm/send';
  */
 async function registerFcmToken(userId, token, platform = 'android', deviceName = 'Mobile Device') {
   if (!userId || !token) return false;
+  const cleanTok = token.trim();
+  const isExpo = cleanTok.startsWith('ExponentPushToken[') || cleanTok.startsWith('ExpoPushToken[');
+
   try {
+    // If registering a new native token, remove any older dead native tokens for this user
+    if (!isExpo) {
+      await pool.query(
+        `DELETE FROM fcm_tokens_app 
+         WHERE user_id = ? AND token != ? AND token NOT LIKE 'Expo%'`,
+        [userId, cleanTok]
+      ).catch(() => {});
+    }
+
     await pool.query(
       `INSERT INTO fcm_tokens_app (user_id, token, platform, device_name)
        VALUES (?, ?, ?, ?)
@@ -121,7 +133,7 @@ async function registerFcmToken(userId, token, platform = 'android', deviceName 
          platform = VALUES(platform),
          device_name = VALUES(device_name),
          updated_at = NOW()`,
-      [userId, token.trim(), platform, deviceName]
+      [userId, cleanTok, platform, deviceName]
     );
 
     // Also update primary fcm_token on user_app if column exists
@@ -130,7 +142,7 @@ async function registerFcmToken(userId, token, platform = 'android', deviceName 
       [userId]
     ).catch(() => {});
 
-    console.log(`[FCM] Registered push token for user #${userId} (${platform}): ${token.slice(0, 15)}...`);
+    console.log(`[FCM] Registered fresh push token for user #${userId} (${platform}): ${cleanTok.slice(0, 15)}...`);
     return true;
   } catch (err) {
     console.error('[FCM] Error registering token:', err.message);
@@ -139,15 +151,16 @@ async function registerFcmToken(userId, token, platform = 'android', deviceName 
 }
 
 /**
- * Retrieve registered push tokens for a list of user IDs
+ * Retrieve registered push tokens for a list of user IDs (newest/freshest first)
  */
 async function getTokensForUsers(userIds) {
   if (!Array.isArray(userIds) || !userIds.length) return [];
   try {
     const [rows] = await pool.query(
-      `SELECT DISTINCT token, platform, user_id AS userId
+      `SELECT token, platform, user_id AS userId
        FROM fcm_tokens_app
-       WHERE user_id IN (?) AND token IS NOT NULL AND token != ''`,
+       WHERE user_id IN (?) AND token IS NOT NULL AND token != ''
+       ORDER BY updated_at DESC, id DESC`,
       [userIds]
     );
     return rows;
@@ -243,6 +256,23 @@ async function sendFcmPush(userIds, title, message, data = {}) {
         sentCount += response.successCount;
         failedCount += response.failureCount;
         console.log(`[FCM/Admin] Dispatched ${response.successCount} direct push notifications via FCM v1 (${response.failureCount} failed).`);
+
+        // Automatically clean up any invalid or expired tokens returned by Google FCM
+        response.responses.forEach((resp, idx) => {
+          if (!resp.success && resp.error) {
+            const errCode = resp.error.code || '';
+            const badToken = directFcmTokens[idx];
+            console.warn(`[FCM/Admin] Token delivery note (${errCode}): ${badToken?.slice(0, 20)}...`);
+            if (
+              errCode === 'messaging/registration-token-not-registered' ||
+              errCode === 'messaging/invalid-registration-token' ||
+              errCode === 'messaging/invalid-argument'
+            ) {
+              console.log(`[FCM/Admin] 🗑️ Removing stale/unregistered token from database: ${badToken?.slice(0, 20)}...`);
+              pool.query('DELETE FROM fcm_tokens_app WHERE token = ?', [badToken]).catch(() => {});
+            }
+          }
+        });
       } catch (e) {
         failedCount += directFcmTokens.length;
         console.error('[FCM/Admin] Error sending direct push:', e.message);
