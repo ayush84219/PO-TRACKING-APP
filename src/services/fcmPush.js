@@ -231,7 +231,7 @@ async function sendFcmPush(userIds, title, message, data = {}) {
         stringData.title = String(title);
         stringData.body = String(message);
         stringData.message = String(message);
-        stringData.channelId = 'materialscan_alerts';
+        stringData.channelId = 'materialscan_alarm_v1';
 
         const response = await messaging.sendEachForMulticast({
           tokens: directFcmTokens,
@@ -242,7 +242,7 @@ async function sendFcmPush(userIds, title, message, data = {}) {
           android: {
             priority: 'high',
             notification: {
-              channelId: 'materialscan_alerts',
+              channelId: 'materialscan_alarm_v1',
               sound: 'default',
               priority: 'max',
               visibility: 'public',
