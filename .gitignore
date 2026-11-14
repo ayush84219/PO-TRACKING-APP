@@ -8,6 +8,8 @@ yarn-error.log*
 .env
 .env.*
 !.env.example
+firebase-service-account.json
+*-adminsdk-*.json
 
 # Logs & Runtime data
 logs/
