@@ -87,8 +87,8 @@ async function checkNewPurchaseOrders() {
 
       console.log(`[POWatcher] 📋 Detected NEW PO Bill: ${formattedPo} (Vendor: ${vendor}, Lot: ${lotNo}, Supervisor: ${assignedSupervisor}, Qty: ${totalQty} ${unit})`);
 
-      const poTitle = `📋 New PO No: ${formattedPo} Generated`;
-      const poBaseMsg = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Assigned Supervisor: ${assignedSupervisor}.`;
+      const poTitle = `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`;
+      const poBaseMsg = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival.`;
 
       // 4. Dispatch notification to EVERY user in ALL PANELS (Gate, Store, Supervisor, Admin)
       for (const u of allUsers) {
@@ -97,13 +97,13 @@ async function checkNewPurchaseOrders() {
 
         if (u.role === 'gate') {
           title = poTitle;
-          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Keep on standby for material arrival at gate.`;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nKeep on standby for material arrival at gate.`;
         } else if (u.role === 'store') {
           title = poTitle;
-          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Assigned to Supervisor: ${assignedSupervisor}.`;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned to Supervisor: ${assignedSupervisor}.`;
         } else if (u.role === 'supervisor') {
           title = poTitle;
-          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Assigned to: ${assignedSupervisor}.`;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned to: ${assignedSupervisor}.`;
         }
 
         await enqueueNotification({

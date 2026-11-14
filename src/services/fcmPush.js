@@ -169,63 +169,45 @@ async function sendFcmPush(userIds, title, message, data = {}) {
     return { sent: 0, failed: 0 };
   }
 
-  const expoTokens = [];
-  const directFcmTokens = [];
-
+  // Group tokens by user to prevent duplicate notifications (never send both Expo and Direct to same user)
+  // Priority: Direct Native FCM (fastest, high-priority heads up) > Expo Push Gateway
+  const tokensByUser = new Map();
   for (const row of tokenRows) {
+    const uid = row.userId;
     const tok = (row.token || '').trim();
-    if (tok.startsWith('ExponentPushToken[') || tok.startsWith('ExpoPushToken[')) {
-      expoTokens.push(tok);
-    } else {
-      directFcmTokens.push(tok);
+    if (!tok) continue;
+    if (!tokensByUser.has(uid)) {
+      tokensByUser.set(uid, []);
+    }
+    tokensByUser.get(uid).push(tok);
+  }
+
+  const directFcmTokens = [];
+  const expoTokens = [];
+
+  for (const [uid, tokens] of tokensByUser.entries()) {
+    const nativeToken = tokens.find(
+      (t) => !t.startsWith('ExponentPushToken[') && !t.startsWith('ExpoPushToken[')
+    );
+    const expoToken = tokens.find(
+      (t) => t.startsWith('ExponentPushToken[') || t.startsWith('ExpoPushToken[')
+    );
+
+    // If Firebase Admin is initialized and user has a native token, send ONLY via Direct FCM
+    if (nativeToken && firebaseInitialized && messaging) {
+      directFcmTokens.push(nativeToken);
+    } else if (expoToken) {
+      // Fallback to Expo if no native token or firebase direct is not ready
+      expoTokens.push(expoToken);
+    } else if (nativeToken) {
+      directFcmTokens.push(nativeToken);
     }
   }
 
   let sentCount = 0;
   let failedCount = 0;
 
-  // 1. Send via Expo Push Service (which automatically delivers through FCM)
-  if (expoTokens.length > 0) {
-    try {
-      const messages = expoTokens.map((to) => ({
-        to,
-        sound: 'default',
-        title,
-        body: message,
-        channelId: 'materialscan_alerts',
-        priority: 'high',
-        _displayInForeground: true,
-        data: {
-          title,
-          message,
-          ...data,
-        },
-      }));
-
-      const res = await fetch(EXPO_PUSH_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify(messages),
-      });
-
-      if (res.ok) {
-        sentCount += expoTokens.length;
-        console.log(`[FCM/Expo] Dispatched ${expoTokens.length} push notifications successfully.`);
-      } else {
-        failedCount += expoTokens.length;
-        const errText = await res.text();
-        console.warn(`[FCM/Expo] Push failed with status ${res.status}:`, errText);
-      }
-    } catch (e) {
-      failedCount += expoTokens.length;
-      console.error('[FCM/Expo] Error dispatching push:', e.message);
-    }
-  }
-
-  // 2. Send via Direct FCM v1 Firebase Admin SDK or Legacy FCM
+  // 1. Send via Direct FCM v1 Firebase Admin SDK (Primary, instant, heads-up alarm)
   if (directFcmTokens.length > 0) {
     if (firebaseInitialized && messaging) {
       try {
@@ -234,7 +216,9 @@ async function sendFcmPush(userIds, title, message, data = {}) {
           stringData[k] = typeof v === 'object' ? JSON.stringify(v) : String(v);
         }
         stringData.title = String(title);
+        stringData.body = String(message);
         stringData.message = String(message);
+        stringData.channelId = 'materialscan_alerts';
 
         const response = await messaging.sendEachForMulticast({
           tokens: directFcmTokens,
@@ -249,6 +233,8 @@ async function sendFcmPush(userIds, title, message, data = {}) {
               sound: 'default',
               priority: 'max',
               visibility: 'public',
+              defaultSound: true,
+              defaultVibrateTimings: true,
             },
           },
           data: stringData,
@@ -256,7 +242,7 @@ async function sendFcmPush(userIds, title, message, data = {}) {
 
         sentCount += response.successCount;
         failedCount += response.failureCount;
-        console.log(`[FCM/Admin] Dispatched ${response.successCount} push notifications via FCM v1.`);
+        console.log(`[FCM/Admin] Dispatched ${response.successCount} direct push notifications via FCM v1 (${response.failureCount} failed).`);
       } catch (e) {
         failedCount += directFcmTokens.length;
         console.error('[FCM/Admin] Error sending direct push:', e.message);
@@ -301,6 +287,47 @@ async function sendFcmPush(userIds, title, message, data = {}) {
       }
     } else {
       console.log(`[FCM] Direct tokens (${directFcmTokens.length}) queued.`);
+    }
+  }
+
+  // 2. Send via Expo Push Service (for devices without direct FCM)
+  if (expoTokens.length > 0) {
+    try {
+      const messages = expoTokens.map((to) => ({
+        to,
+        sound: 'default',
+        title,
+        body: message,
+        channelId: 'materialscan_alerts',
+        priority: 'high',
+        _displayInForeground: true,
+        data: {
+          title,
+          message,
+          ...data,
+        },
+      }));
+
+      const res = await fetch(EXPO_PUSH_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(messages),
+      });
+
+      if (res.ok) {
+        sentCount += expoTokens.length;
+        console.log(`[FCM/Expo] Dispatched ${expoTokens.length} push notifications successfully.`);
+      } else {
+        failedCount += expoTokens.length;
+        const errText = await res.text();
+        console.warn(`[FCM/Expo] Push failed with status ${res.status}:`, errText);
+      }
+    } catch (e) {
+      failedCount += expoTokens.length;
+      console.error('[FCM/Expo] Error dispatching push:', e.message);
     }
   }
 
