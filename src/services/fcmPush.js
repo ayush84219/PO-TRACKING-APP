@@ -17,28 +17,87 @@ try {
   const { initializeApp, cert, getApps } = require('firebase-admin/app');
   const { getMessaging } = require('firebase-admin/messaging');
 
-  const possiblePaths = [
-    process.env.FIREBASE_SERVICE_ACCOUNT_KEY,
-    path.resolve(__dirname, '../../firebase-service-account.json'),
-    path.resolve(process.cwd(), 'firebase-service-account.json'),
-    path.resolve(process.cwd(), 'gate-enter-firebase-adminsdk-fbsvc-85b7f320a7.json'),
-    path.resolve(__dirname, '../../../gate-enter-firebase-adminsdk-fbsvc-85b7f320a7.json'),
-  ].filter(Boolean);
+  let credential = null;
 
-  const keyFile = possiblePaths.find((p) => fs.existsSync(p));
-  if (keyFile) {
-    const keyJson = JSON.parse(fs.readFileSync(path.resolve(keyFile), 'utf8'));
+  // 1. Direct environment variables: FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY
+  if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+    try {
+      credential = cert({
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      });
+      console.log('[FCM] Firebase Admin configured via individual environment variables.');
+    } catch (e) {
+      console.warn('[FCM] Error parsing individual Firebase env vars:', e.message);
+    }
+  }
+
+  // 2. Direct JSON string in FIREBASE_SERVICE_ACCOUNT_KEY or FIREBASE_SERVICE_ACCOUNT_JSON
+  if (!credential) {
+    const rawJson = process.env.FIREBASE_SERVICE_ACCOUNT_KEY || process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (rawJson && rawJson.trim().startsWith('{')) {
+      try {
+        const keyJson = JSON.parse(rawJson.trim());
+        credential = cert(keyJson);
+        console.log('[FCM] Firebase Admin configured via JSON string in environment variable.');
+      } catch (e) {
+        console.warn('[FCM] Error parsing Firebase JSON env var:', e.message);
+      }
+    }
+  }
+
+  // 3. Base64 encoded JSON in FIREBASE_SERVICE_ACCOUNT_BASE64
+  if (!credential && process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
+    try {
+      const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
+      const keyJson = JSON.parse(decoded);
+      credential = cert(keyJson);
+      console.log('[FCM] Firebase Admin configured via Base64 environment variable.');
+    } catch (e) {
+      console.warn('[FCM] Error parsing Firebase Base64 env var:', e.message);
+    }
+  }
+
+  // 4. File path on disk
+  if (!credential) {
+    const possiblePaths = [
+      process.env.FIREBASE_SERVICE_ACCOUNT_KEY,
+      path.resolve(__dirname, '../../firebase-service-account.json'),
+      path.resolve(process.cwd(), 'firebase-service-account.json'),
+      path.resolve(process.cwd(), 'gate-enter-firebase-adminsdk-fbsvc-85b7f320a7.json'),
+      path.resolve(__dirname, '../../../gate-enter-firebase-adminsdk-fbsvc-85b7f320a7.json'),
+      'd:/MaterialScan/gate-enter-firebase-adminsdk-fbsvc-85b7f320a7.json',
+      'd:/MaterialScan/MaterialScan/backend/firebase-service-account.json',
+    ].filter(Boolean);
+
+    const keyFile = possiblePaths.find((p) => {
+      try {
+        return fs.existsSync(p);
+      } catch {
+        return false;
+      }
+    });
+
+    if (keyFile) {
+      const keyJson = JSON.parse(fs.readFileSync(path.resolve(keyFile), 'utf8'));
+      credential = cert(keyJson);
+      console.log(`[FCM] Firebase Admin configured via key file: ${path.basename(keyFile)}`);
+    }
+  }
+
+  if (credential) {
     let app;
     if (!getApps().length) {
-      app = initializeApp({
-        credential: cert(keyJson),
-      });
+      app = initializeApp({ credential });
     } else {
       app = getApps()[0];
     }
     messaging = getMessaging(app);
     firebaseInitialized = true;
     console.log('[FCM] Firebase Admin SDK v1 initialized successfully (gate-enter)');
+  } else {
+    console.warn('[FCM] Note: Firebase Admin credentials not found. Direct FCM v1 will wait for credentials.');
   }
 } catch (err) {
   console.warn('[FCM] Firebase Admin initialization note:', err.message);
