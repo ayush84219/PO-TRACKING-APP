@@ -1,12 +1,48 @@
+const path = require('path');
+const fs = require('fs');
 const pool = require('../db/pool');
 
 /**
  * FCM Push Notification Service
  * Supports:
- * - Direct FCM v1 / Legacy FCM REST API
+ * - Direct FCM v1 via Firebase Admin SDK (gate-enter)
  * - Expo Push Notification Gateway (which routes to FCM for Android and APNs for iOS)
  * - MySQL token registry (fcm_tokens_app)
  */
+
+let messaging = null;
+let firebaseInitialized = false;
+
+try {
+  const { initializeApp, cert, getApps } = require('firebase-admin/app');
+  const { getMessaging } = require('firebase-admin/messaging');
+
+  const possiblePaths = [
+    process.env.FIREBASE_SERVICE_ACCOUNT_KEY,
+    path.resolve(__dirname, '../../firebase-service-account.json'),
+    path.resolve(process.cwd(), 'firebase-service-account.json'),
+    path.resolve(process.cwd(), 'gate-enter-firebase-adminsdk-fbsvc-85b7f320a7.json'),
+    path.resolve(__dirname, '../../../gate-enter-firebase-adminsdk-fbsvc-85b7f320a7.json'),
+  ].filter(Boolean);
+
+  const keyFile = possiblePaths.find((p) => fs.existsSync(p));
+  if (keyFile) {
+    const keyJson = JSON.parse(fs.readFileSync(path.resolve(keyFile), 'utf8'));
+    let app;
+    if (!getApps().length) {
+      app = initializeApp({
+        credential: cert(keyJson),
+      });
+    } else {
+      app = getApps()[0];
+    }
+    messaging = getMessaging(app);
+    firebaseInitialized = true;
+    console.log('[FCM] Firebase Admin SDK v1 initialized successfully (gate-enter)');
+  }
+} catch (err) {
+  console.warn('[FCM] Firebase Admin initialization note:', err.message);
+}
 
 const FCM_SERVER_KEY = process.env.FCM_SERVER_KEY || '';
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
@@ -130,9 +166,43 @@ async function sendFcmPush(userIds, title, message, data = {}) {
     }
   }
 
-  // 2. Send via Direct FCM REST API
+  // 2. Send via Direct FCM v1 Firebase Admin SDK or Legacy FCM
   if (directFcmTokens.length > 0) {
-    if (FCM_SERVER_KEY) {
+    if (firebaseInitialized && messaging) {
+      try {
+        const stringData = {};
+        for (const [k, v] of Object.entries(data || {})) {
+          stringData[k] = typeof v === 'object' ? JSON.stringify(v) : String(v);
+        }
+        stringData.title = String(title);
+        stringData.message = String(message);
+
+        const response = await messaging.sendEachForMulticast({
+          tokens: directFcmTokens,
+          notification: {
+            title,
+            body: message,
+          },
+          android: {
+            priority: 'high',
+            notification: {
+              channelId: 'materialscan_alerts',
+              sound: 'default',
+              priority: 'max',
+              visibility: 'public',
+            },
+          },
+          data: stringData,
+        });
+
+        sentCount += response.successCount;
+        failedCount += response.failureCount;
+        console.log(`[FCM/Admin] Dispatched ${response.successCount} push notifications via FCM v1.`);
+      } catch (e) {
+        failedCount += directFcmTokens.length;
+        console.error('[FCM/Admin] Error sending direct push:', e.message);
+      }
+    } else if (FCM_SERVER_KEY) {
       try {
         const payload = {
           registration_ids: directFcmTokens,
@@ -161,7 +231,7 @@ async function sendFcmPush(userIds, title, message, data = {}) {
 
         if (res.ok) {
           sentCount += directFcmTokens.length;
-          console.log(`[FCM] Dispatched ${directFcmTokens.length} direct FCM notifications.`);
+          console.log(`[FCM] Dispatched ${directFcmTokens.length} direct legacy FCM notifications.`);
         } else {
           failedCount += directFcmTokens.length;
           console.warn(`[FCM] Push failed with status ${res.status}:`, await res.text());
@@ -171,7 +241,7 @@ async function sendFcmPush(userIds, title, message, data = {}) {
         console.error('[FCM] Error sending direct push:', e.message);
       }
     } else {
-      console.log(`[FCM] Direct tokens (${directFcmTokens.length}) queued. (FCM_SERVER_KEY optional)`);
+      console.log(`[FCM] Direct tokens (${directFcmTokens.length}) queued.`);
     }
   }
 
