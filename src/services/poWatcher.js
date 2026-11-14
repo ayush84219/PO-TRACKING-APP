@@ -53,6 +53,7 @@ async function checkNewPurchaseOrders() {
       const cleanDigits = rawNum.replace(/[^0-9]/g, '') || rawNum;
       const formattedPo = cleanDigits.startsWith('PO-') ? cleanDigits : `PO-${cleanDigits}`;
       const vendor = po.vendor_name || 'Vendor';
+      const lotNo = po.design_name || cleanDigits;
 
       // Parse quantity and items
       let totalQty = 1;
@@ -84,22 +85,25 @@ async function checkNewPurchaseOrders() {
 
       if (!assignedSupervisor) assignedSupervisor = defaultSupName;
 
-      console.log(`[POWatcher] 📋 Detected NEW PO Bill: ${formattedPo} (Vendor: ${vendor}, Supervisor: ${assignedSupervisor}, Qty: ${totalQty} ${unit})`);
+      console.log(`[POWatcher] 📋 Detected NEW PO Bill: ${formattedPo} (Vendor: ${vendor}, Lot: ${lotNo}, Supervisor: ${assignedSupervisor}, Qty: ${totalQty} ${unit})`);
+
+      const poTitle = `📋 New PO No: ${formattedPo} Generated`;
+      const poBaseMsg = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Assigned Supervisor: ${assignedSupervisor}.`;
 
       // 4. Dispatch notification to EVERY user in ALL PANELS (Gate, Store, Supervisor, Admin)
       for (const u of allUsers) {
-        let title = `📋 New PO Bill Generated: ${formattedPo}`;
-        let message = `PO Bill #${cleanDigits} generated. Vendor: ${vendor}. Material: ${itemsSummary} (${totalQty} ${unit}). Assigned Supervisor: ${assignedSupervisor}.`;
+        let title = poTitle;
+        let message = poBaseMsg;
 
         if (u.role === 'gate') {
-          title = `📋 New PO Created: ${formattedPo}`;
-          message = `New PO #${cleanDigits} (${vendor} - ${itemsSummary}, ${totalQty} ${unit}). Keep on standby for material arrival at gate.`;
+          title = poTitle;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Keep on standby for material arrival at gate.`;
         } else if (u.role === 'store') {
-          title = `📋 New PO Created: ${formattedPo}`;
-          message = `New PO #${cleanDigits} (${vendor} - ${itemsSummary}, ${totalQty} ${unit}). Assigned to Supervisor: ${assignedSupervisor}.`;
+          title = poTitle;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Assigned to Supervisor: ${assignedSupervisor}.`;
         } else if (u.role === 'supervisor') {
-          title = `📋 New PO Bill: ${formattedPo}`;
-          message = `PO #${cleanDigits} generated for ${vendor}. Material: ${itemsSummary} (${totalQty} ${unit}). Assigned to: ${assignedSupervisor}.`;
+          title = poTitle;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}. (Supplier: ${vendor}, Material: ${itemsSummary}, Qty: ${totalQty} ${unit}). Assigned to: ${assignedSupervisor}.`;
         }
 
         await enqueueNotification({
@@ -110,6 +114,7 @@ async function checkNewPurchaseOrders() {
           message,
           payload: {
             poNumber: formattedPo,
+            lotNo,
             vendor,
             items: itemsSummary,
             totalQuantity: totalQty,
@@ -126,10 +131,11 @@ async function checkNewPurchaseOrders() {
       if (userIds.length > 0) {
         sendPush(
           userIds,
-          `📋 New PO Bill: ${formattedPo}`,
-          `Vendor: ${vendor} • ${itemsSummary} (${totalQty} ${unit}). Ready in all panels.`,
+          poTitle,
+          poBaseMsg,
           {
             lotNumber: formattedPo,
+            lotNo,
             type: 'po_generated',
             supervisor: assignedSupervisor,
             isEmergencyAlarm: false,
@@ -145,6 +151,7 @@ async function checkNewPurchaseOrders() {
           eventType: 'PO_GENERATED',
           isEmergencyAlarm: false, // Normal notification! No continuous emergency siren
           billNumber: formattedPo,
+          lotNo,
           supplierName: vendor,
           materialDetails: `${itemsSummary} (${totalQty} ${unit})`,
           designName: po.design_name || '',
@@ -153,8 +160,8 @@ async function checkNewPurchaseOrders() {
           scanTime: new Date().toISOString(),
           billId: formattedPo,
           source: 'ERP / Database',
-          title: `📋 New PO Created: ${formattedPo}`,
-          message: `PO #${cleanDigits} generated. Vendor: ${vendor}. Material: ${itemsSummary} (${totalQty} ${unit}). Assigned: ${assignedSupervisor}.`,
+          title: poTitle,
+          message: poBaseMsg,
           status: 'delivered',
           timestamp: new Date().toISOString(),
         };

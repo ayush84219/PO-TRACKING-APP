@@ -387,17 +387,43 @@ router.post('/', wrap(async (req, res) => {
     );
     scanId = sr.insertId;
 
-    // Fetch vendor/supplier name for enriched notification payload
+    // Fetch vendor/supplier name & lot number for enriched notification payload
     let poVendor = 'Supplier';
+    let lotNumberDisplay = docLot;
     try {
       const [poRows] = await conn.query(
-        'SELECT vendor_name FROM purchase_orders_app WHERE po_number = ? OR po_number = ? LIMIT 1',
+        'SELECT vendor_name, design_name FROM purchase_orders_app WHERE po_number = ? OR po_number = ? LIMIT 1',
         [docLot, docLot.replace(/^PO-/, '')]
       );
-      if (poRows.length && poRows[0].vendor_name) {
-        poVendor = poRows[0].vendor_name;
+      if (poRows.length) {
+        if (poRows[0].vendor_name) poVendor = poRows[0].vendor_name;
+        if (poRows[0].design_name) lotNumberDisplay = poRows[0].design_name;
       }
     } catch {}
+
+    try {
+      const [mainPo] = await conn.query(
+        'SELECT vendorName, designName FROM purchase_orders WHERE poNumber = ? OR poNumber = ? OR id = ? LIMIT 1',
+        [docLot, docLot.replace(/^PO-/, ''), docLot.replace(/[^0-9]/g, '')]
+      );
+      if (mainPo.length) {
+        if (mainPo[0].vendorName) poVendor = mainPo[0].vendorName;
+        if (mainPo[0].designName) lotNumberDisplay = mainPo[0].designName;
+      }
+    } catch {}
+
+    if (lotNumberDisplay === docLot) {
+      try {
+        const [oldPo] = await conn.query(
+          'SELECT supplier, lot_no FROM old_purchase_orders WHERE po_number = ? OR po_number = ? LIMIT 1',
+          [docLot, docLot.replace(/^PO-/, '')]
+        );
+        if (oldPo.length) {
+          if (oldPo[0].supplier) poVendor = oldPo[0].supplier;
+          if (oldPo[0].lot_no) lotNumberDisplay = oldPo[0].lot_no;
+        }
+      } catch {}
+    }
 
     // Sync PO status in purchase_orders & purchase_orders_app
     if (!isRgp && isPoPattern) {
@@ -504,14 +530,18 @@ router.post('/', wrap(async (req, res) => {
       const isPartial = status === 'pending';
       const isRgpItem = isRgp || scanStage === 'GATE_IN';
       const notifTitle = isRgpItem
-        ? `📥 RGP Material Gate Par Aa Gya (${docLot})`
+        ? (isPartial ? `⚠️ Half Material Received in Gate (${docLot})` : `🚨 Successfully Received Material in Gate (${docLot})`)
         : (isPartial
-            ? `🚚 Material Gate Par Aa Gya: ${docLot} (Half Delivery)`
-            : `🚚 Material Gate Par Aa Gya: ${docLot} (Full Delivery)`);
+            ? `⚠️ Half Material Received in Gate (${docLot})`
+            : `🚨 Successfully Received Material in Gate (${docLot})`);
 
       const notifMessage = isRgpItem
-        ? `RGP ${docLot} (${materialName || 'Material'}) returned to Factory Gate (${isPartial ? 'Half Return' : 'Complete Return'}). Verified by ${me.name}. Please verify inward.`
-        : `NEW MATERIAL ARRIVED AT GATE. Please verify and process this bill.`;
+        ? (isPartial
+            ? `Half return material received in gate (Partial return). RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor}). Waiting for balance return.`
+            : `Successfully received return material in gate. RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor}). Awaiting supervisor inward.`)
+        : (isPartial
+            ? `Half material received in gate (Partial delivery). PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'}). Waiting for remaining delivery.`
+            : `Successfully received material in gate. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'}). Ready for Store collection.`);
 
       // Real-time Socket.IO notification immediately delivered to Store Person and Supervisor
       sendGateScanNotification({
@@ -552,6 +582,7 @@ router.post('/', wrap(async (req, res) => {
           payload: {
             eventId,
             lotNumber: docLot,
+            lotNo: lotNumberDisplay,
             materialName,
             supplierName: poVendor,
             verifiedStage: isPartial ? 'Gate Partial Verified' : 'Gate Full Verified',
@@ -571,8 +602,8 @@ router.post('/', wrap(async (req, res) => {
 
     } else if (isStoreScan || scanStage === 'STORE_INWARD') {
       // Step 2: Store Inward & Collection from Gate
-      const storeTitle = `📦 Material Received & Scanned by Store (${docLot})`;
-      const storeMessage = `MATERIAL RECEIVED AND SCANNED BY STORE. Please verify the bill.`;
+      const storeTitle = `📦 Successfully Received Material in Store (${docLot})`;
+      const storeMessage = `Successfully received material in store. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Received by Store Officer ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'}). Please verify the bill.`;
 
       // Real-time Socket.IO notification immediately delivered to Supervisor
       sendStoreScanNotification({
@@ -613,6 +644,7 @@ router.post('/', wrap(async (req, res) => {
           payload: {
             eventId,
             lotNumber: docLot,
+            lotNo: lotNumberDisplay,
             materialName,
             supplierName: poVendor,
             verifiedStage: 'Store Collected',
@@ -637,18 +669,18 @@ router.post('/', wrap(async (req, res) => {
       const isRgpItem = isRgp || scanStage === 'SUPERVISOR_INWARD';
 
       const pickupTitle = isRgpItem
-        ? (isPartialReceipt ? `📦 RGP Half Inwarded by Supervisor (${docLot})` : `✅ RGP Closed & Completed (${docLot})`)
+        ? (isPartialReceipt ? `📦 Supervisor Half Received RGP No: ${docLot}` : `✅ Supervisor Received RGP No: ${docLot}`)
         : (isPartialReceipt
-            ? `📦 PO-${docLot.replace(/^PO-/, '')} Half Received by Supervisor`
-            : `✅ PO-${docLot.replace(/^PO-/, '')} Closed & Completed`);
+            ? `📦 Supervisor Half Received PO No: ${docLot}`
+            : `✅ Supervisor Received PO No: ${docLot}`);
 
       const pickupMessage = isRgpItem
         ? (isPartialReceipt
-            ? `RGP ${docLot} - Half/partial return verified by Supervisor ${me.name}.`
-            : `RGP ${docLot} - Return material verified and RGP officially CLOSED by Supervisor ${me.name}.`)
+            ? `Supervisor half received RGP No: ${docLot}. Half return material verified by Supervisor ${me.name}. Waiting for balance return.`
+            : `Supervisor received RGP No: ${docLot}. Complete return material verified & RGP officially CLOSED by Supervisor ${me.name}.`)
         : (isPartialReceipt
-            ? `PO ${docLot} (${materialName || 'Material'}) - Half/Partial delivery verified & received by Supervisor ${me.name}. Waiting for remaining delivery.`
-            : `PO ${docLot} (${materialName || 'Material'}) - Complete material verified & PO officially CLOSED by Supervisor ${me.name}.`);
+            ? `Supervisor half received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Half/partial delivery verified & received by Supervisor ${me.name}. Waiting for remaining delivery.`
+            : `Supervisor received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Complete material verified & PO officially CLOSED by Supervisor ${me.name}.`);
 
       // Real-time Socket.IO notification to Gate, Store, and Admin
       sendSupervisorScanNotification({
