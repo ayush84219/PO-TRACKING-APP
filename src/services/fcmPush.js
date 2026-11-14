@@ -99,6 +99,7 @@ async function sendFcmPush(userIds, title, message, data = {}) {
         body: message,
         channelId: 'materialscan_alerts',
         priority: 'high',
+        _displayInForeground: true,
         data: {
           title,
           message,
