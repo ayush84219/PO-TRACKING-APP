@@ -600,7 +600,12 @@ router.post('/', wrap(async (req, res) => {
       }
 
       if (targets.length > 0) {
-        sendPush(targets.map(s => s.id), notifTitle, notifMessage, { lotNumber: docLot, eventId, type: 'gate_arrival' });
+        sendPush(targets.map(s => s.id), notifTitle, notifMessage, {
+          lotNumber: docLot,
+          eventId,
+          type: 'gate_arrival',
+          isEmergencyAlarm: true,
+        });
       }
 
     } else if (isStoreScan || scanStage === 'STORE_INWARD') {
@@ -664,7 +669,12 @@ router.post('/', wrap(async (req, res) => {
       }
 
       if (targets.length > 0) {
-        sendPush(targets.map(s => s.id), storeTitle, storeMessage, { lotNumber: docLot, eventId, type: 'store_inward' });
+        sendPush(targets.map(s => s.id), storeTitle, storeMessage, {
+          lotNumber: docLot,
+          eventId,
+          type: 'store_inward',
+          isEmergencyAlarm: true,
+        });
       }
 
     } else if (isSupervisorScan || scanStage === 'SUPERVISOR_PICKUP' || scanStage === 'SUPERVISOR_INWARD') {
@@ -741,7 +751,11 @@ router.post('/', wrap(async (req, res) => {
       }
 
       if (targets.length > 0) {
-        sendPush(targets.map(g => g.id), pickupTitle, pickupMessage, { lotNumber: docLot, type: 'supervisor_pickup' });
+        sendPush(targets.map((g) => g.id), pickupTitle, pickupMessage, {
+          lotNumber: docLot,
+          type: 'supervisor_pickup',
+          isEmergencyAlarm: true,
+        });
       }
     } else {
       // Fallback for ANY other scan (custom lot, raw materials, admin scan, etc.)

@@ -88,22 +88,29 @@ async function checkNewPurchaseOrders() {
       console.log(`[POWatcher] 📋 Detected NEW PO Bill: ${formattedPo} (Vendor: ${vendor}, Lot: ${lotNo}, Supervisor: ${assignedSupervisor}, Qty: ${totalQty} ${unit})`);
 
       const poTitle = `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`;
-      const poBaseMsg = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival.`;
+      const poBaseMsg = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival at gate.`;
 
-      // 4. Dispatch notification to EVERY user in ALL PANELS (Gate, Store, Supervisor, Admin)
-      for (const u of allUsers) {
+      // 4. Target ONLY Security (Gate) and Supervisor (plus Admin) for initial PO generation
+      const poTargetUsers = allUsers.filter(
+        (u) =>
+          u.role === 'gate' ||
+          u.role === 'supervisor' ||
+          u.role === 'admin' ||
+          u.base_role === 'gate' ||
+          u.base_role === 'supervisor' ||
+          u.base_role === 'admin'
+      );
+
+      for (const u of poTargetUsers) {
         let title = poTitle;
         let message = poBaseMsg;
 
         if (u.role === 'gate') {
           title = poTitle;
-          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nKeep on standby for material arrival at gate.`;
-        } else if (u.role === 'store') {
-          title = poTitle;
-          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned to Supervisor: ${assignedSupervisor}.`;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nSecurity: Keep on standby for material arrival at gate.`;
         } else if (u.role === 'supervisor') {
           title = poTitle;
-          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned to: ${assignedSupervisor}.`;
+          message = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nSupervisor: Assigned to ${assignedSupervisor}. Standby for gate inward.`;
         }
 
         await enqueueNotification({
@@ -121,16 +128,16 @@ async function checkNewPurchaseOrders() {
             unit,
             supervisor: assignedSupervisor,
             type: 'po_generated',
-            isEmergencyAlarm: false, // Normal notification!
+            isEmergencyAlarm: false,
           },
         }).catch(() => {});
       }
 
-      // 5. Send push notifications to mobile devices
-      const userIds = allUsers.map(u => u.id);
-      if (userIds.length > 0) {
+      // 5. Send immediate push notification to Security and Supervisor
+      const poTargetIds = poTargetUsers.map((u) => u.id);
+      if (poTargetIds.length > 0) {
         sendPush(
-          userIds,
+          poTargetIds,
           poTitle,
           poBaseMsg,
           {
@@ -142,6 +149,53 @@ async function checkNewPurchaseOrders() {
           }
         );
       }
+
+      // 6. Schedule Active Material Alarm 15s after PO generation to alert Security & Supervisor to stay active!
+      setTimeout(() => {
+        const standbyAlarmTitle = `🚨 ALARM: Material Standby (PO ${formattedPo})`;
+        const standbyAlarmBody = `PO No: ${formattedPo} (Lot ${lotNo}) approaching Gate!\nSupplier: ${vendor} • ${itemsSummary}\nSecurity & Supervisor: Be active for parcel arrival!`;
+
+        console.log(`[POWatcher] ⏰ Triggering 15s Standby Alarm for ${formattedPo} (Gate & Supervisor)...`);
+
+        // Send high-priority emergency alarm push outside the app
+        sendPush(
+          poTargetIds,
+          standbyAlarmTitle,
+          standbyAlarmBody,
+          {
+            lotNumber: formattedPo,
+            lotNo,
+            type: 'po_standby_alarm',
+            isEmergencyAlarm: true,
+          }
+        );
+
+        // Emit continuous in-app siren alarm to Gate and Supervisor panels
+        const activeIo = getIO();
+        if (activeIo) {
+          activeIo
+            .to('gate-notifications')
+            .to('supervisor-notifications')
+            .to('admin-notifications')
+            .emit('new_notification', {
+              eventId: `EVT-ALARM-PO-${cleanDigits}-${Date.now()}`,
+              eventType: 'MATERIAL_STANDBY_ALARM',
+              isEmergencyAlarm: true,
+              billNumber: formattedPo,
+              lotNo,
+              supplierName: vendor,
+              materialDetails: `${itemsSummary} (${totalQty} ${unit})`,
+              scannerName: assignedSupervisor,
+              scanTime: new Date().toISOString(),
+              billId: formattedPo,
+              source: 'PO Standby Alarm',
+              title: standbyAlarmTitle,
+              message: standbyAlarmBody,
+              status: 'pending',
+              timestamp: new Date().toISOString(),
+            });
+        }
+      }, 15000); // 15-second alarm trigger!
 
       // 6. Broadcast Real-time Normal Notification to ALL connected panels via Socket.IO
       const io = getIO();
