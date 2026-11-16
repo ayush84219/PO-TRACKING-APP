@@ -10,9 +10,17 @@ router.use(authenticate, requireRole('admin'));
 router.get('/', wrap(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT u.id, u.name, u.email, u.role, u.is_active AS isActive, u.created_at AS createdAt,
+            COALESCE(u.plain_password, 'SupervisorPassword123!') AS plainPassword,
             (SELECT COUNT(*) FROM scans_app s WHERE s.scanned_by = u.id) AS scanCount
      FROM user_app u ORDER BY u.created_at DESC`);
-  res.json({ items: rows.map(r => ({ ...r, isActive: !!r.isActive, scanCount: +r.scanCount })) });
+  res.json({
+    items: rows.map(r => ({
+      ...r,
+      isActive: !!r.isActive,
+      scanCount: +r.scanCount,
+      plainPassword: r.plainPassword,
+    }))
+  });
 }));
 
 router.post('/', wrap(async (req, res) => {
@@ -48,8 +56,8 @@ router.post('/', wrap(async (req, res) => {
   const hash = await bcrypt.hash(rawPassword, 10);
 
   const [result] = await pool.query(
-    'INSERT INTO user_app (name, email, password_hash, role, base_role, is_active) VALUES (?, ?, ?, ?, ?, 1)',
-    [name, email, hash, role, role]
+    'INSERT INTO user_app (name, email, password_hash, role, base_role, is_active, plain_password) VALUES (?, ?, ?, ?, ?, 1, ?)',
+    [name, email, hash, role, role, rawPassword]
   );
 
   res.status(201).json({
@@ -63,8 +71,42 @@ router.post('/', wrap(async (req, res) => {
       scanCount: 0,
       createdAt: new Date().toISOString(),
       tempPassword: rawPassword,
+      plainPassword: rawPassword,
     },
     message: `${role.toUpperCase()} added successfully!`,
+  });
+}));
+
+router.patch('/:id/password', wrap(async (req, res) => {
+  const id = parseInt(req.params.id);
+  const newPassword = (req.body.password && String(req.body.password).trim().length >= 6)
+    ? String(req.body.password).trim()
+    : `Sup@${Math.floor(1000 + Math.random() * 9000)}`;
+
+  const hash = await bcrypt.hash(newPassword, 10);
+  const [r] = await pool.query(
+    'UPDATE user_app SET password_hash = ?, plain_password = ? WHERE id = ?',
+    [hash, newPassword, id]
+  );
+  if (!r.affectedRows) throw new AppError(404, 'User not found', 'not_found');
+
+  // Revoke active sessions for that user
+  await pool.query('UPDATE refresh_tokens_app SET revoked = 1 WHERE user_id = ?', [id]).catch(() => {});
+
+  const [userRows] = await pool.query('SELECT id, name, email, role FROM user_app WHERE id = ?', [id]);
+  const targetUser = userRows[0] || {};
+
+  res.json({
+    ok: true,
+    user: {
+      id: targetUser.id,
+      name: targetUser.name,
+      email: targetUser.email,
+      role: targetUser.role,
+      plainPassword: newPassword,
+    },
+    newPassword,
+    message: `Password for ${targetUser.name || 'User'} updated successfully!`,
   });
 }));
 

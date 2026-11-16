@@ -29,6 +29,7 @@ async function initSchema() {
         name VARCHAR(100) NOT NULL,
         email VARCHAR(190) NOT NULL UNIQUE,
         password_hash VARCHAR(100) NOT NULL,
+        plain_password VARCHAR(100) NULL,
         role ENUM('admin','user','supervisor','gate','store') NOT NULL DEFAULT 'user',
         base_role ENUM('admin','supervisor','gate','store','user') NULL,
         app_name VARCHAR(100) NULL,
@@ -370,6 +371,18 @@ async function initSchema() {
       await conn.query(`ALTER TABLE po_alarm_events_app ADD COLUMN expired_at DATETIME NULL`);
     } catch {}
 
+    // Ensure plain_password column exists on user_app for admin view and management
+    try {
+      await conn.query(`ALTER TABLE user_app ADD COLUMN plain_password VARCHAR(100) NULL`);
+    } catch {}
+
+    // Populate default passwords if plain_password is null
+    await conn.query(`UPDATE user_app SET plain_password = 'AdminPassword123!' WHERE (role = 'admin' OR base_role = 'admin') AND plain_password IS NULL`).catch(() => {});
+    await conn.query(`UPDATE user_app SET plain_password = 'GatePassword123!' WHERE (role = 'gate' OR base_role = 'gate') AND plain_password IS NULL`).catch(() => {});
+    await conn.query(`UPDATE user_app SET plain_password = 'StorePassword123!' WHERE (role = 'store' OR base_role = 'store') AND plain_password IS NULL`).catch(() => {});
+    await conn.query(`UPDATE user_app SET plain_password = 'SupervisorPassword123!' WHERE (role = 'supervisor' OR base_role = 'supervisor') AND plain_password IS NULL`).catch(() => {});
+    await conn.query(`UPDATE user_app SET plain_password = 'UserPassword123!' WHERE plain_password IS NULL`).catch(() => {});
+
     // Ensure all essential standard accounts exist in user_app
     const adminPass = await bcrypt.hash('AdminPassword123!', 10);
     const gatePass = await bcrypt.hash('GatePassword123!', 10);
@@ -377,14 +390,14 @@ async function initSchema() {
     const supPass = await bcrypt.hash('SupervisorPassword123!', 10);
 
     await conn.query(
-      `INSERT IGNORE INTO user_app (name, email, password_hash, role, base_role, is_active) VALUES
-       ('Admin Operations', 'admin@billtracking.com', ?, 'admin', 'admin', 1),
-       ('Admin User', 'admin@materialscan.com', ?, 'admin', 'admin', 1),
-       ('Ayush Admin', 'ay104061@gmail.com', ?, 'admin', 'admin', 1),
-       ('Ramesh Security (Gate 1)', 'gate@billtracking.com', ?, 'gate', 'gate', 1),
-       ('Store Manager (Main Store)', 'store@billtracking.com', ?, 'store', 'store', 1),
-       ('EJAJ', 'ejaj@billtracking.com', ?, 'supervisor', 'supervisor', 1),
-       ('Amit Kumar (Warehouse A)', 'supervisor@billtracking.com', ?, 'supervisor', 'supervisor', 1)`,
+      `INSERT IGNORE INTO user_app (name, email, password_hash, role, base_role, is_active, plain_password) VALUES
+       ('Admin Operations', 'admin@billtracking.com', ?, 'admin', 'admin', 1, 'AdminPassword123!'),
+       ('Admin User', 'admin@materialscan.com', ?, 'admin', 'admin', 1, 'AdminPassword123!'),
+       ('Ayush Admin', 'ay104061@gmail.com', ?, 'admin', 'admin', 1, 'AdminPassword123!'),
+       ('Ramesh Security (Gate 1)', 'gate@billtracking.com', ?, 'gate', 'gate', 1, 'GatePassword123!'),
+       ('Store Manager (Main Store)', 'store@billtracking.com', ?, 'store', 'store', 1, 'StorePassword123!'),
+       ('EJAJ', 'ejaj@billtracking.com', ?, 'supervisor', 'supervisor', 1, 'SupervisorPassword123!'),
+       ('Amit Kumar (Warehouse A)', 'supervisor@billtracking.com', ?, 'supervisor', 'supervisor', 1, 'SupervisorPassword123!')`,
       [adminPass, adminPass, adminPass, gatePass, storePass, supPass, supPass]
     ).catch(() => {});
 

@@ -36,8 +36,8 @@ router.post('/register', wrap(async (req, res) => {
   if (ex.length) throw new AppError(409, 'Email already registered', 'email_taken');
   const hash = await bcrypt.hash(password, 10);
   const [r] = await pool.query(
-    'INSERT INTO user_app (name, email, password_hash, role, base_role) VALUES (?,?,?,?,?)',
-    [name, email, hash, userRole, userRole]
+    'INSERT INTO user_app (name, email, password_hash, role, base_role, plain_password) VALUES (?,?,?,?,?,?)',
+    [name, email, hash, userRole, userRole, password]
   );
   const user = { id: r.insertId, name, email, role: userRole, baseRole: userRole };
   res.status(201).json({ user: pub(user), ...(await tokenPair(user)) });
