@@ -21,6 +21,19 @@ router.post('/', wrap(async (req, res) => {
   const email = parsed.email.trim().toLowerCase();
   const role = parsed.role || 'supervisor';
 
+  // If creating an Admin account, require and verify the ADMIN_SECRET_KEY from .env
+  if (role === 'admin') {
+    const expectedKey = process.env.ADMIN_SECRET_KEY || 'bill520';
+    const providedKey = parsed.secretKey || parsed.adminSecretKey || req.body.secretKey || req.body.adminSecretKey;
+    if (!providedKey || String(providedKey).trim() !== String(expectedKey).trim()) {
+      throw new AppError(
+        403,
+        'Invalid Admin Secret Key. The secret key (e.g. bill520) configured in server .env is required to create an Admin account.',
+        'invalid_secret_key'
+      );
+    }
+  }
+
   // Check if email already registered
   const [existing] = await pool.query('SELECT id FROM user_app WHERE email = ?', [email]);
   if (existing.length > 0) {
