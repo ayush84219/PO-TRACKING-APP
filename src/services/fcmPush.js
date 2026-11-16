@@ -228,10 +228,11 @@ async function sendFcmPush(userIds, title, message, data = {}) {
         for (const [k, v] of Object.entries(data || {})) {
           stringData[k] = typeof v === 'object' ? JSON.stringify(v) : String(v);
         }
+        const targetChannel = data.channelId || (data.isEmergencyAlarm ? 'po_alarm_channel' : 'materialscan_alarm_v1');
         stringData.title = String(title);
         stringData.body = String(message);
         stringData.message = String(message);
-        stringData.channelId = 'materialscan_alarm_v1';
+        stringData.channelId = targetChannel;
 
         const response = await messaging.sendEachForMulticast({
           tokens: directFcmTokens,
@@ -242,12 +243,13 @@ async function sendFcmPush(userIds, title, message, data = {}) {
           android: {
             priority: 'high',
             notification: {
-              channelId: 'materialscan_alarm_v1',
+              channelId: targetChannel,
               sound: 'default',
               priority: 'max',
               visibility: 'public',
               defaultSound: true,
               defaultVibrateTimings: true,
+              tag: data.eventId ? String(data.eventId) : undefined,
             },
           },
           data: stringData,
@@ -328,7 +330,7 @@ async function sendFcmPush(userIds, title, message, data = {}) {
         sound: 'default',
         title,
         body: message,
-        channelId: 'materialscan_alerts',
+        channelId: data.channelId || (data.isEmergencyAlarm ? 'po_alarm_channel' : 'materialscan_alerts'),
         priority: 'high',
         _displayInForeground: true,
         data: {

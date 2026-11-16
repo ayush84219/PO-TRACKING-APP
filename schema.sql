@@ -183,3 +183,37 @@ CREATE TABLE IF NOT EXISTS supervisor_details_app (
   INDEX idx_brand_app (brand),
   INDEX idx_garment_type_app (garment_type)
 );
+
+CREATE TABLE IF NOT EXISTS user_notification_settings_app (
+  user_id INT PRIMARY KEY,
+  po_alerts_enabled TINYINT(1) NOT NULL DEFAULT 1,
+  alarm_sound_enabled TINYINT(1) NOT NULL DEFAULT 1,
+  alarm_tone VARCHAR(50) NOT NULL DEFAULT 'alarm_siren',
+  alarm_duration_sec INT NOT NULL DEFAULT 30,
+  repeat_alarm TINYINT(1) NOT NULL DEFAULT 1,
+  repeat_interval_sec INT NOT NULL DEFAULT 60,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES user_app(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS po_alarm_events_app (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  event_id VARCHAR(100) NOT NULL UNIQUE,
+  po_number VARCHAR(100) NOT NULL,
+  supplier_name VARCHAR(255) NULL,
+  amount VARCHAR(50) NULL,
+  received_at DATETIME NOT NULL,
+  status ENUM('active', 'stopped', 'opened') NOT NULL DEFAULT 'active',
+  stopped_by_user_id INT NULL,
+  stopped_by_user_name VARCHAR(100) NULL,
+  stopped_at DATETIME NULL,
+  opened_by_user_id INT NULL,
+  opened_at DATETIME NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (stopped_by_user_id) REFERENCES user_app(id) ON DELETE SET NULL,
+  FOREIGN KEY (opened_by_user_id) REFERENCES user_app(id) ON DELETE SET NULL,
+  INDEX idx_po_alarm_po (po_number),
+  INDEX idx_po_alarm_status (status),
+  INDEX idx_po_alarm_created (created_at)
+);

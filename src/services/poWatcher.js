@@ -2,6 +2,7 @@ const pool = require('../db/pool');
 const { sendPush } = require('./push');
 const { enqueueNotification } = require('./notificationQueue');
 const { getIO } = require('./socketService');
+const { triggerPoAlarm } = require('./poAlarmService');
 
 let watcherTimer = null;
 let isChecking = false;
@@ -133,22 +134,16 @@ async function checkNewPurchaseOrders() {
         }).catch(() => {});
       }
 
-      // 5. Send immediate push notification to Security and Supervisor
-      const poTargetIds = poTargetUsers.map((u) => u.id);
-      if (poTargetIds.length > 0) {
-        sendPush(
-          poTargetIds,
-          poTitle,
-          poBaseMsg,
-          {
-            lotNumber: formattedPo,
-            lotNo,
-            type: 'po_generated',
-            supervisor: assignedSupervisor,
-            isEmergencyAlarm: false,
-          }
-        );
-      }
+      // 5. Trigger Smart PO Alert and Alarm Notification (Uber/Rapido style, OPEN PO & STOP ALARM actions)
+      await triggerPoAlarm({
+        poNumber: formattedPo,
+        vendorName: vendor,
+        amount: po.total || (po.subtotal ? Number(po.subtotal) + Number(po.tax || 0) : null),
+        orderDate: po.date || new Date(),
+        items: itemsSummary,
+        designName: po.design_name,
+        triggeredBy: 'PO Generator',
+      }).catch((err) => console.error('[POWatcher] Error triggering Smart PO Alarm:', err.message));
 
       // 6. Schedule Active Material Alarm 15s after PO generation to alert Security & Supervisor to stay active!
       setTimeout(() => {

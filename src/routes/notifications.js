@@ -666,4 +666,92 @@ router.post('/fcm-token', wrap(async (req, res) => {
   res.json({ ok, token });
 }));
 
+// ============================================================================
+// Smart PO Alert & Alarm Notification Endpoints
+// ============================================================================
+const {
+  getUserNotificationSettings,
+  updateUserNotificationSettings,
+  stopPoAlarm,
+  openPoAlarm,
+  sendTestPoAlarm,
+  triggerPoAlarm,
+} = require('../services/poAlarmService');
+
+/**
+ * GET /notifications/settings
+ * Fetch user's notification & alarm configuration
+ */
+router.get('/settings', wrap(async (req, res) => {
+  const settings = await getUserNotificationSettings(req.user.id);
+  res.json({ ok: true, settings });
+}));
+
+/**
+ * PUT /notifications/settings
+ * Update user's notification & alarm configuration
+ */
+router.put('/settings', wrap(async (req, res) => {
+  const updated = await updateUserNotificationSettings(req.user.id, req.body || {});
+  res.json({ ok: true, settings: updated });
+}));
+
+/**
+ * POST /notifications/alarm/stop
+ * STOP ALARM action handler: immediately silences alarm and records stopped state
+ */
+router.post('/alarm/stop', wrap(async (req, res) => {
+  const { eventId, poNumber } = req.body || {};
+  const result = await stopPoAlarm({
+    eventId,
+    poNumber,
+    userId: req.user.id,
+    userName: req.user.name,
+  });
+  res.json(result);
+}));
+
+/**
+ * POST /notifications/alarm/open
+ * OPEN PO action handler: records user opened the PO from alert
+ */
+router.post('/alarm/open', wrap(async (req, res) => {
+  const { eventId, poNumber } = req.body || {};
+  const result = await openPoAlarm({
+    eventId,
+    poNumber,
+    userId: req.user.id,
+    userName: req.user.name,
+  });
+  res.json(result);
+}));
+
+/**
+ * POST /notifications/alarm/test
+ * Triggers a live test PO alert on user's phone for verification
+ */
+router.post('/alarm/test', wrap(async (req, res) => {
+  const result = await sendTestPoAlarm(req.user.id, req.user.name);
+  res.json(result);
+}));
+
+/**
+ * POST /notifications/alarm/trigger
+ * Manually trigger PO alarm (Admin / testing)
+ */
+router.post('/alarm/trigger', wrap(async (req, res) => {
+  const { poNumber, vendorName, amount, items, designName } = req.body || {};
+  if (!poNumber) return res.status(400).json({ error: 'poNumber is required' });
+
+  const result = await triggerPoAlarm({
+    poNumber,
+    vendorName,
+    amount,
+    items,
+    designName,
+    triggeredBy: `${req.user.name} (${req.user.role})`,
+  });
+  res.json(result);
+}));
+
 module.exports = router;
