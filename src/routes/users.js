@@ -128,4 +128,47 @@ router.patch('/:id/active', wrap(async (req, res) => {
   if (!isActive) await pool.query('UPDATE refresh_tokens_app SET revoked = 1 WHERE user_id = ?', [id]);
   res.json({ ok: true });
 }));
+
+router.delete('/:id', wrap(async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (id === req.user.id) {
+    throw new AppError(400, "You cannot delete your own admin account", 'invalid_action');
+  }
+
+  const [userRows] = await pool.query('SELECT id, name, email, role, is_active FROM user_app WHERE id = ?', [id]);
+  if (!userRows.length) {
+    throw new AppError(404, 'User not found', 'not_found');
+  }
+  const targetUser = userRows[0];
+
+  // Safety Requirement: User must be disabled first before permanently deleting!
+  if (targetUser.is_active && !req.query.force) {
+    throw new AppError(
+      400,
+      `User #${id} (${targetUser.name}) is currently Active. Please disable the account first before deleting it.`,
+      'must_disable_first'
+    );
+  }
+
+  // Clean up references in related tables to avoid foreign key constraints
+  await pool.query('DELETE FROM refresh_tokens_app WHERE user_id = ?', [id]).catch(() => {});
+  await pool.query('DELETE FROM user_notification_settings_app WHERE user_id = ?', [id]).catch(() => {});
+  await pool.query('DELETE FROM notification_queue_app WHERE user_id = ?', [id]).catch(() => {});
+  await pool.query('DELETE FROM po_alarm_events_app WHERE recipient_user_id = ?', [id]).catch(() => {});
+  await pool.query('UPDATE scans_app SET scanned_by = NULL WHERE scanned_by = ?', [id]).catch(() => {});
+  await pool.query('UPDATE materials_app SET last_scanned_by = NULL WHERE last_scanned_by = ?', [id]).catch(() => {});
+
+  const [del] = await pool.query('DELETE FROM user_app WHERE id = ?', [id]);
+  if (!del.affectedRows) {
+    throw new AppError(404, 'User not found', 'not_found');
+  }
+
+  res.json({
+    ok: true,
+    deletedId: id,
+    name: targetUser.name,
+    message: `User #${id} (${targetUser.name}) permanently deleted.`,
+  });
+}));
+
 module.exports = router;

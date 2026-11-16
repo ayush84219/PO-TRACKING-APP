@@ -19,17 +19,15 @@ router.post('/register', wrap(async (req, res) => {
   const { name, email, password, role, secretKey, adminSecretKey } = S.register.parse(req.body);
   const userRole = role || 'gate';
 
-  // If registering as Admin, require and verify the ADMIN_SECRET_KEY from .env
-  if (userRole === 'admin') {
-    const expectedKey = process.env.ADMIN_SECRET_KEY || 'bill520';
-    const providedKey = secretKey || adminSecretKey || req.body.secretKey || req.body.adminSecretKey;
-    if (!providedKey || String(providedKey).trim() !== String(expectedKey).trim()) {
-      throw new AppError(
-        403,
-        'Invalid Admin Secret Key. The secret key (e.g. bill520) configured in server .env is required to create an Administrator account.',
-        'invalid_secret_key'
-      );
-    }
+  // Public user self-registration is disabled. Only Admin can issue accounts or authorize registration with ADMIN_SECRET_KEY
+  const expectedKey = process.env.ADMIN_SECRET_KEY || 'bill520';
+  const providedKey = secretKey || adminSecretKey || req.body.secretKey || req.body.adminSecretKey;
+  if (!providedKey || String(providedKey).trim() !== String(expectedKey).trim()) {
+    throw new AppError(
+      403,
+      'Public registration is disabled. User accounts can only be created by an Administrator in the Admin Panel.',
+      'registration_disabled'
+    );
   }
 
   const [ex] = await pool.query('SELECT id FROM user_app WHERE email = ?', [email]);
