@@ -59,6 +59,8 @@ async function triggerPoAlarm({
   items = null,
   designName = null,
   triggeredBy = 'System / ERP',
+  assignedSupervisor = null,
+  assignedSupervisorId = null,
 }) {
   if (!poNumber) return null;
 
@@ -112,7 +114,35 @@ async function triggerPoAlarm({
     );
 
     // Keep users who haven't disabled PO alerts
-    targetUsers = users.filter((u) => u.po_alerts_enabled !== 0);
+    const activeEnabledUsers = users.filter((u) => u.po_alerts_enabled !== 0);
+
+    // Filter supervisors: if assignedSupervisor is specified, route ONLY to that specific supervisor!
+    targetUsers = activeEnabledUsers.filter((u) => {
+      const isSupervisor = (u.role === 'supervisor' || u.base_role === 'supervisor');
+      if (isSupervisor && (assignedSupervisor || assignedSupervisorId)) {
+        if (assignedSupervisorId && Number(u.id) === Number(assignedSupervisorId)) {
+          return true;
+        }
+        if (assignedSupervisor) {
+          const supTarget = String(assignedSupervisor).trim().toLowerCase();
+          const uName = String(u.name || '').trim().toLowerCase();
+          const uEmail = String(u.email || '').trim().toLowerCase();
+          return uName.includes(supTarget) || supTarget.includes(uName) || uEmail.includes(supTarget);
+        }
+        return false;
+      }
+      return true; // gate, store, admin always receive notification
+    });
+
+    // If supervisor was assigned but no active supervisor matched by name, fallback to first active supervisor
+    const hasSupervisor = targetUsers.some((u) => u.role === 'supervisor' || u.base_role === 'supervisor');
+    if (!hasSupervisor && (assignedSupervisor || assignedSupervisorId)) {
+      const allActiveSups = activeEnabledUsers.filter((u) => u.role === 'supervisor' || u.base_role === 'supervisor');
+      if (allActiveSups.length > 0) {
+        console.warn(`[POAlarmService] ⚠️ No exact match for supervisor "${assignedSupervisor}". Alerting first available supervisor: ${allActiveSups[0].name} (ID: ${allActiveSups[0].id})`);
+        targetUsers.push(allActiveSups[0]);
+      }
+    }
   } catch (err) {
     console.error('[POAlarmService] Error querying target users:', err.message);
   }
@@ -133,7 +163,8 @@ async function triggerPoAlarm({
 
   // 4. Construct Notification Details
   const title = '🚨 NEW PURCHASE ORDER RECEIVED!';
-  const body = `PO Number: ${formattedPo}\nSupplier: ${displaySupplier}\nAmount: ${displayAmount}\nTime: ${displayTime}`;
+  const supervisorLine = assignedSupervisor ? `\nSupervisor: ${assignedSupervisor}` : '';
+  const body = `PO Number: ${formattedPo}\nSupplier: ${displaySupplier}\nAmount: ${displayAmount}\nTime: ${displayTime}${supervisorLine}`;
 
   const notificationData = {
     type: 'PO_ALARM',
@@ -144,6 +175,8 @@ async function triggerPoAlarm({
     vendorName: displaySupplier,
     amount: displayAmount,
     receivedTime: displayTime,
+    assignedSupervisor: assignedSupervisor || '',
+    assignedSupervisorId: String(assignedSupervisorId || ''),
     timestamp: nowIso,
     channelId: 'po_alarm_channel',
     isEmergencyAlarm: 'true',

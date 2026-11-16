@@ -18,6 +18,12 @@ module.exports = {
     scanStage: z.enum(['GATE_INWARD', 'GATE_OUT', 'GATE_IN', 'STORE_INWARD', 'SUPERVISOR_PICKUP', 'SUPERVISOR_INWARD']).optional(),
     docType: z.enum(['PO', 'RGP', 'LOT']).optional(),
   }),
+  createUser: z.object({
+    name: z.string().trim().min(2).max(100),
+    email: z.string().trim().toLowerCase().email(),
+    password: z.string().min(6).max(100).optional(),
+    role: z.enum(['admin', 'supervisor', 'gate', 'store', 'user']).default('supervisor'),
+  }),
   role: z.object({ role: z.enum(['admin', 'supervisor', 'gate', 'store', 'user']) }),
   active: z.object({ isActive: z.boolean() }),
   status,

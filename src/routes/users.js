@@ -1,4 +1,5 @@
 const router = require('express').Router();
+const bcrypt = require('bcrypt');
 const pool = require('../db/pool');
 const S = require('../validators/schemas');
 const { wrap, AppError } = require('../middleware/errors');
@@ -12,6 +13,46 @@ router.get('/', wrap(async (req, res) => {
             (SELECT COUNT(*) FROM scans_app s WHERE s.scanned_by = u.id) AS scanCount
      FROM user_app u ORDER BY u.created_at DESC`);
   res.json({ items: rows.map(r => ({ ...r, isActive: !!r.isActive, scanCount: +r.scanCount })) });
+}));
+
+router.post('/', wrap(async (req, res) => {
+  const parsed = S.createUser.parse(req.body);
+  const name = parsed.name.trim();
+  const email = parsed.email.trim().toLowerCase();
+  const role = parsed.role || 'supervisor';
+
+  // Check if email already registered
+  const [existing] = await pool.query('SELECT id FROM user_app WHERE email = ?', [email]);
+  if (existing.length > 0) {
+    throw new AppError(409, `User with email "${email}" already exists`, 'email_taken');
+  }
+
+  // Use provided password or auto-generate one
+  const rawPassword = (parsed.password && parsed.password.trim().length >= 6)
+    ? parsed.password.trim()
+    : `Sup@${Math.floor(1000 + Math.random() * 9000)}`;
+
+  const hash = await bcrypt.hash(rawPassword, 10);
+
+  const [result] = await pool.query(
+    'INSERT INTO user_app (name, email, password_hash, role, base_role, is_active) VALUES (?, ?, ?, ?, ?, 1)',
+    [name, email, hash, role, role]
+  );
+
+  res.status(201).json({
+    ok: true,
+    user: {
+      id: result.insertId,
+      name,
+      email,
+      role,
+      isActive: true,
+      scanCount: 0,
+      createdAt: new Date().toISOString(),
+      tempPassword: rawPassword,
+    },
+    message: `${role.toUpperCase()} added successfully!`,
+  });
 }));
 
 router.patch('/:id/role', wrap(async (req, res) => {

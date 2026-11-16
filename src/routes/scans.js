@@ -476,6 +476,19 @@ router.post('/', wrap(async (req, res) => {
       details: { scanId, materialId, materialName, status, note, scanStage, rescanned },
     });
 
+    // Lookup Assigned Supervisor for targeted alarm & notification routing
+    let assignedSupervisorName = null;
+    try {
+      const cleanDigits = docLot.replace(/[^0-9]/g, '');
+      const [supRow] = await pool.query(
+        "SELECT supervisor FROM supervisor_details_app WHERE lot_number IN (?, ?, ?) LIMIT 1",
+        [cleanDigits, docLot, docLot.replace(/^PO-/, '')]
+      );
+      if (supRow.length && supRow[0].supervisor) {
+        assignedSupervisorName = supRow[0].supervisor;
+      }
+    } catch {}
+
     const [allAdmins] = await pool.query(
       "SELECT id, name, role FROM user_app WHERE (role = 'admin' OR base_role = 'admin') AND is_active = 1"
     );
@@ -506,8 +519,15 @@ router.post('/', wrap(async (req, res) => {
       const [sups] = await pool.query(
         "SELECT id, name, role FROM user_app WHERE (role = 'supervisor' OR base_role = 'supervisor') AND is_active = 1"
       );
+      let targetSups = sups;
+      if (assignedSupervisorName) {
+        const supKey = assignedSupervisorName.trim().toLowerCase();
+        const matched = sups.filter(s => (s.name || '').toLowerCase().includes(supKey) || supKey.includes((s.name || '').toLowerCase()));
+        if (matched.length > 0) targetSups = matched;
+      }
+
       const recipientMap = new Map();
-      [...sups, ...allAdmins].forEach(u => recipientMap.set(u.id, u));
+      [...targetSups, ...allAdmins].forEach(u => recipientMap.set(u.id, u));
       const targets = Array.from(recipientMap.values());
 
       for (const target of targets) {
@@ -535,13 +555,14 @@ router.post('/', wrap(async (req, res) => {
             ? `⚠️ Half Material Received in Gate (${docLot})`
             : `🚨 Successfully Received Material in Gate (${docLot})`);
 
+      const supNote = assignedSupervisorName ? ` | Assigned: ${assignedSupervisorName}` : '';
       const notifMessage = isRgpItem
         ? (isPartial
-            ? `Half return material received in gate (Partial return). RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor}). Waiting for balance return.`
-            : `Successfully received return material in gate. RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor}). Awaiting supervisor inward.`)
+            ? `Half return material received in gate (Partial return). RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor})${supNote}. Waiting for balance return.`
+            : `Successfully received return material in gate. RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor})${supNote}. Awaiting supervisor inward.`)
         : (isPartial
-            ? `Half material received in gate (Partial delivery). PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'}). Waiting for remaining delivery.`
-            : `Successfully received material in gate. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'}). Ready for Store collection.`);
+            ? `Half material received in gate (Partial delivery). PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Waiting for remaining delivery.`
+            : `Successfully received material in gate. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Ready for Store collection.`);
 
       // Real-time Socket.IO notification immediately delivered to Store Person and Supervisor
       sendGateScanNotification({
@@ -563,13 +584,20 @@ router.post('/', wrap(async (req, res) => {
         "SELECT id, name, role FROM user_app WHERE (role = 'supervisor' OR base_role = 'supervisor') AND is_active = 1 AND id != ?",
         [me.id]
       );
+      let targetSups = sups;
+      if (assignedSupervisorName) {
+        const supKey = assignedSupervisorName.trim().toLowerCase();
+        const matched = sups.filter(s => (s.name || '').toLowerCase().includes(supKey) || supKey.includes((s.name || '').toLowerCase()));
+        if (matched.length > 0) targetSups = matched;
+      }
+
       const [stores] = await pool.query(
         "SELECT id, name, role FROM user_app WHERE (role = 'store' OR base_role = 'store') AND is_active = 1 AND id != ?",
         [me.id]
       );
 
       const recipientMap = new Map();
-      [...stores, ...sups, ...allAdmins].forEach(u => {
+      [...stores, ...targetSups, ...allAdmins].forEach(u => {
         if (u.id !== me.id) recipientMap.set(u.id, u);
       });
       const targets = Array.from(recipientMap.values());
@@ -610,8 +638,9 @@ router.post('/', wrap(async (req, res) => {
 
     } else if (isStoreScan || scanStage === 'STORE_INWARD') {
       // Step 2: Store Inward & Collection from Gate
+      const supNote = assignedSupervisorName ? ` | Assigned: ${assignedSupervisorName}` : '';
       const storeTitle = `📦 Successfully Received Material in Store (${docLot})`;
-      const storeMessage = `Successfully received material in store. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Received by Store Officer ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'}). Please verify the bill.`;
+      const storeMessage = `Successfully received material in store. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Received by Store Officer ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Please verify the bill.`;
 
       // Real-time Socket.IO notification immediately delivered to Supervisor
       sendStoreScanNotification({
@@ -633,13 +662,20 @@ router.post('/', wrap(async (req, res) => {
         "SELECT id, name, role FROM user_app WHERE (role = 'supervisor' OR base_role = 'supervisor') AND is_active = 1 AND id != ?",
         [me.id]
       );
+      let targetSups = sups;
+      if (assignedSupervisorName) {
+        const supKey = assignedSupervisorName.trim().toLowerCase();
+        const matched = sups.filter(s => (s.name || '').toLowerCase().includes(supKey) || supKey.includes((s.name || '').toLowerCase()));
+        if (matched.length > 0) targetSups = matched;
+      }
+
       const [gates] = await pool.query(
         "SELECT id, name, role FROM user_app WHERE (role = 'gate' OR base_role = 'gate') AND is_active = 1 AND id != ?",
         [me.id]
       );
 
       const recipientMap = new Map();
-      [...sups, ...gates, ...allAdmins].forEach(u => {
+      [...targetSups, ...gates, ...allAdmins].forEach(u => {
         if (u.id !== me.id) recipientMap.set(u.id, u);
       });
       const targets = Array.from(recipientMap.values());

@@ -91,16 +91,32 @@ async function checkNewPurchaseOrders() {
       const poTitle = `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`;
       const poBaseMsg = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival at gate.`;
 
-      // 4. Target ONLY Security (Gate) and Supervisor (plus Admin) for initial PO generation
-      const poTargetUsers = allUsers.filter(
-        (u) =>
-          u.role === 'gate' ||
-          u.role === 'supervisor' ||
-          u.role === 'admin' ||
-          u.base_role === 'gate' ||
-          u.base_role === 'supervisor' ||
-          u.base_role === 'admin'
-      );
+      // 4. Target Security (Gate), Admin, and ONLY the Specific Assigned Supervisor
+      const poTargetUsers = allUsers.filter((u) => {
+        const isGate = u.role === 'gate' || u.base_role === 'gate';
+        const isAdmin = u.role === 'admin' || u.base_role === 'admin';
+        if (isGate || isAdmin) return true;
+
+        const isSupervisor = u.role === 'supervisor' || u.base_role === 'supervisor';
+        if (isSupervisor) {
+          if (assignedSupervisor) {
+            const supTarget = String(assignedSupervisor).trim().toLowerCase();
+            const uName = String(u.name || '').trim().toLowerCase();
+            const uEmail = String(u.email || '').trim().toLowerCase();
+            return uName.includes(supTarget) || supTarget.includes(uName) || uEmail.includes(supTarget);
+          }
+          return true;
+        }
+        return false;
+      });
+
+      // Fallback: if assigned supervisor didn't match any registered user, pick first supervisor so alert is delivered
+      const hasSupervisorTarget = poTargetUsers.some(u => u.role === 'supervisor' || u.base_role === 'supervisor');
+      if (!hasSupervisorTarget && supervisors.length > 0) {
+        poTargetUsers.push(supervisors[0]);
+      }
+
+      const poTargetIds = poTargetUsers.map(u => u.id);
 
       for (const u of poTargetUsers) {
         let title = poTitle;
@@ -143,6 +159,7 @@ async function checkNewPurchaseOrders() {
         items: itemsSummary,
         designName: po.design_name,
         triggeredBy: 'PO Generator',
+        assignedSupervisor,
       }).catch((err) => console.error('[POWatcher] Error triggering Smart PO Alarm:', err.message));
 
       // 6. Schedule Active Material Alarm 15s after PO generation to alert Security & Supervisor to stay active!
