@@ -49,8 +49,8 @@ router.post('/', wrap(async (req, res) => {
   }
 
   // Use provided password or auto-generate one
-  const rawPassword = (parsed.password && parsed.password.trim().length >= 6)
-    ? parsed.password.trim()
+  const rawPassword = (parsed.password && String(parsed.password).trim().length >= 1)
+    ? String(parsed.password).trim()
     : `Sup@${Math.floor(1000 + Math.random() * 9000)}`;
 
   const hash = await bcrypt.hash(rawPassword, 10);
@@ -79,7 +79,7 @@ router.post('/', wrap(async (req, res) => {
 
 router.patch('/:id/password', wrap(async (req, res) => {
   const id = parseInt(req.params.id);
-  const newPassword = (req.body.password && String(req.body.password).trim().length >= 6)
+  const newPassword = (req.body.password && String(req.body.password).trim().length >= 1)
     ? String(req.body.password).trim()
     : `Sup@${Math.floor(1000 + Math.random() * 9000)}`;
 
@@ -131,9 +131,6 @@ router.patch('/:id/active', wrap(async (req, res) => {
 
 router.delete('/:id', wrap(async (req, res) => {
   const id = parseInt(req.params.id);
-  if (id === req.user.id) {
-    throw new AppError(400, "You cannot delete your own admin account", 'invalid_action');
-  }
 
   const [userRows] = await pool.query('SELECT id, name, email, role, is_active FROM user_app WHERE id = ?', [id]);
   if (!userRows.length) {
@@ -141,13 +138,29 @@ router.delete('/:id', wrap(async (req, res) => {
   }
   const targetUser = userRows[0];
 
-  // Safety Requirement: User must be disabled first before permanently deleting!
+  // Prevent deleting oneself while currently logged in and active
+  if (id === req.user.id && targetUser.is_active) {
+    throw new AppError(400, "You cannot delete your own active account while signed in. Another admin can delete it once disabled.", 'invalid_action');
+  }
+
+  // Safety Requirement: User/Admin must be disabled first before permanently deleting!
   if (targetUser.is_active && !req.query.force) {
     throw new AppError(
       400,
       `User #${id} (${targetUser.name}) is currently Active. Please disable the account first before deleting it.`,
       'must_disable_first'
     );
+  }
+
+  // If target user is an Admin, ensure at least one other active Admin remains
+  if (targetUser.role === 'admin') {
+    const [admins] = await pool.query(
+      "SELECT COUNT(*) AS total FROM user_app WHERE role = 'admin' AND is_active = 1 AND id != ?",
+      [id]
+    );
+    if (admins[0].total < 1) {
+      throw new AppError(400, "Cannot delete the last remaining active Admin account. At least one admin must exist.", 'invalid_action');
+    }
   }
 
   // Clean up references in related tables to avoid foreign key constraints
@@ -167,7 +180,7 @@ router.delete('/:id', wrap(async (req, res) => {
     ok: true,
     deletedId: id,
     name: targetUser.name,
-    message: `User #${id} (${targetUser.name}) permanently deleted.`,
+    message: `${targetUser.role.toUpperCase()} #${id} (${targetUser.name}) permanently deleted.`,
   });
 }));
 

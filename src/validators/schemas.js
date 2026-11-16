@@ -23,7 +23,7 @@ module.exports = {
   createUser: z.object({
     name: z.string().trim().min(2).max(100),
     email: z.string().trim().toLowerCase().email(),
-    password: z.string().min(6).max(100).optional(),
+    password: z.string().min(1).max(100).optional(),
     role: z.enum(['admin', 'supervisor', 'gate', 'store', 'user']).default('supervisor'),
     secretKey: z.string().optional(),
     adminSecretKey: z.string().optional(),
