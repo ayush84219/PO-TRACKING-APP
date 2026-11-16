@@ -674,9 +674,30 @@ const {
   updateUserNotificationSettings,
   stopPoAlarm,
   openPoAlarm,
+  markPoAlarmDelivered,
+  getPendingAlarmsForUser,
   sendTestPoAlarm,
   triggerPoAlarm,
 } = require('../services/poAlarmService');
+
+/**
+ * POST /notifications/alarm/delivered
+ * Marks PO alert status as DELIVERED upon device confirmation
+ */
+router.post('/alarm/delivered', wrap(async (req, res) => {
+  const { eventId, poNumber } = req.body || {};
+  const ok = await markPoAlarmDelivered(eventId, poNumber);
+  res.json({ ok, status: 'DELIVERED' });
+}));
+
+/**
+ * GET /notifications/alarm/pending
+ * Retrieve pending unexpired PO alarms for offline user reconnection
+ */
+router.get('/alarm/pending', wrap(async (req, res) => {
+  const items = await getPendingAlarmsForUser(req.user.id);
+  res.json({ ok: true, items });
+}));
 
 /**
  * GET /notifications/settings

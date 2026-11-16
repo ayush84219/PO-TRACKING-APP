@@ -318,7 +318,7 @@ async function initSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
-    // 13. po_alarm_events_app (Idempotent tracking of PO alert & alarm status)
+    // 13. po_alarm_events_app (Idempotent tracking of PO alert & alarm status: SENT, DELIVERED, STOPPED, OPENED, EXPIRED)
     await conn.query(`
       CREATE TABLE IF NOT EXISTS po_alarm_events_app (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -326,13 +326,18 @@ async function initSchema() {
         po_number VARCHAR(100) NOT NULL,
         supplier_name VARCHAR(255) NULL,
         amount VARCHAR(50) NULL,
+        recipient_user_id INT NULL,
         received_at DATETIME NOT NULL,
-        status ENUM('active', 'stopped', 'opened') NOT NULL DEFAULT 'active',
+        sent_at DATETIME NULL,
+        delivered_at DATETIME NULL,
+        status ENUM('PENDING', 'SENT', 'DELIVERED', 'STOPPED', 'OPENED', 'EXPIRED') NOT NULL DEFAULT 'SENT',
         stopped_by_user_id INT NULL,
         stopped_by_user_name VARCHAR(100) NULL,
         stopped_at DATETIME NULL,
         opened_by_user_id INT NULL,
         opened_at DATETIME NULL,
+        expires_at DATETIME NULL,
+        expired_at DATETIME NULL,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (stopped_by_user_id) REFERENCES user_app(id) ON DELETE SET NULL,
         FOREIGN KEY (opened_by_user_id) REFERENCES user_app(id) ON DELETE SET NULL,
@@ -341,6 +346,29 @@ async function initSchema() {
         INDEX idx_po_alarm_created (created_at)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+
+    // Ensure status enum and tracking columns exist on existing deployments
+    try {
+      await conn.query(`
+        ALTER TABLE po_alarm_events_app
+          MODIFY COLUMN status ENUM('PENDING', 'SENT', 'DELIVERED', 'STOPPED', 'OPENED', 'EXPIRED') NOT NULL DEFAULT 'SENT'
+      `);
+    } catch {}
+    try {
+      await conn.query(`ALTER TABLE po_alarm_events_app ADD COLUMN recipient_user_id INT NULL`);
+    } catch {}
+    try {
+      await conn.query(`ALTER TABLE po_alarm_events_app ADD COLUMN sent_at DATETIME NULL`);
+    } catch {}
+    try {
+      await conn.query(`ALTER TABLE po_alarm_events_app ADD COLUMN delivered_at DATETIME NULL`);
+    } catch {}
+    try {
+      await conn.query(`ALTER TABLE po_alarm_events_app ADD COLUMN expires_at DATETIME NULL`);
+    } catch {}
+    try {
+      await conn.query(`ALTER TABLE po_alarm_events_app ADD COLUMN expired_at DATETIME NULL`);
+    } catch {}
 
     // Ensure all essential standard accounts exist in user_app
     const adminPass = await bcrypt.hash('AdminPassword123!', 10);

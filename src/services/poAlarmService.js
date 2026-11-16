@@ -27,7 +27,29 @@ function formatTimeDisplay(dateInput) {
 }
 
 /**
+ * Periodically check and mark alarms as EXPIRED after 60 seconds
+ */
+async function checkAndExpireAlarms() {
+  try {
+    const [res] = await pool.query(
+      `UPDATE po_alarm_events_app
+       SET status = 'EXPIRED', expired_at = NOW()
+       WHERE status IN ('SENT', 'DELIVERED', 'PENDING') AND expires_at IS NOT NULL AND expires_at < NOW()`
+    );
+    if (res.affectedRows > 0) {
+      console.log(`[POAlarmService] ⏰ Marked ${res.affectedRows} PO alarms as EXPIRED (60s auto-expiry reached).`);
+    }
+  } catch (err) {
+    // Safe execution
+  }
+}
+
+// Start 15s interval for expiring alarms
+setInterval(checkAndExpireAlarms, 15000);
+
+/**
  * Triggers a Smart PO Alert and Alarm Notification
+ * Saves status as SENT, expires_at = NOW() + 60s
  */
 async function triggerPoAlarm({
   poNumber,
@@ -48,17 +70,17 @@ async function triggerPoAlarm({
   const displayTime = formatTimeDisplay(orderDate);
   const nowIso = new Date().toISOString();
 
-  // 1. Idempotency Check: Prevent duplicate active alarms for the exact same PO
+  // 1. Idempotency Check: Prevent duplicate active alerts for the exact same PO while not expired
   try {
     const [existing] = await pool.query(
       `SELECT id, event_id, status FROM po_alarm_events_app 
-       WHERE po_number = ? AND status = 'active'
+       WHERE po_number = ? AND status IN ('SENT', 'DELIVERED', 'PENDING') AND (expires_at IS NULL OR expires_at > NOW())
        ORDER BY id DESC LIMIT 1`,
       [formattedPo]
     );
 
     if (existing.length > 0) {
-      console.log(`[POAlarmService] ⚠️ Active alarm already running for ${formattedPo} (${existing[0].event_id}). Skipping duplicate.`);
+      console.log(`[POAlarmService] ⚠️ Active alert already ringing/pending for ${formattedPo} (${existing[0].event_id}). Skipping duplicate.`);
       return {
         success: true,
         isDuplicate: true,
@@ -72,18 +94,7 @@ async function triggerPoAlarm({
 
   const eventId = `EVT-PO-ALARM-${cleanDigits}-${Date.now()}`;
 
-  // 2. Persist alarm event in database
-  try {
-    await pool.query(
-      `INSERT INTO po_alarm_events_app (event_id, po_number, supplier_name, amount, received_at, status)
-       VALUES (?, ?, ?, ?, NOW(), 'active')`,
-      [eventId, formattedPo, displaySupplier, displayAmount]
-    );
-  } catch (err) {
-    console.error('[POAlarmService] Error recording alarm event:', err.message);
-  }
-
-  // 3. Query all target users (Gate, Store, Supervisor, Admin) and filter by notification settings
+  // 2. Query target users (Gate, Store, Supervisor, Admin) and check notification settings
   let targetUsers = [];
   try {
     const [users] = await pool.query(
@@ -108,7 +119,19 @@ async function triggerPoAlarm({
 
   const targetUserIds = targetUsers.map((u) => u.id);
 
-  // 4. Construct Uber/Rapido-style Notification Details
+  // 3. Persist alarm event in database with status 'SENT', 60s expiration
+  try {
+    await pool.query(
+      `INSERT INTO po_alarm_events_app 
+         (event_id, po_number, supplier_name, amount, received_at, sent_at, expires_at, status)
+       VALUES (?, ?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 60 SECOND), 'SENT')`,
+      [eventId, formattedPo, displaySupplier, displayAmount]
+    );
+  } catch (err) {
+    console.error('[POAlarmService] Error recording alarm event:', err.message);
+  }
+
+  // 4. Construct Notification Details
   const title = '🚨 NEW PURCHASE ORDER RECEIVED!';
   const body = `PO Number: ${formattedPo}\nSupplier: ${displaySupplier}\nAmount: ${displayAmount}\nTime: ${displayTime}`;
 
@@ -126,11 +149,11 @@ async function triggerPoAlarm({
     isEmergencyAlarm: 'true',
     actions: JSON.stringify([
       { id: 'OPEN_PO', title: 'OPEN PO' },
-      { id: 'STOP_ALARM', title: 'STOP ALARM' },
+      { id: 'STOP_ALARM', title: 'STOP' },
     ]),
   };
 
-  // 5. Send High-Priority FCM Push Notification (works outside app, locked screen, background, killed state)
+  // 5. Send High-Priority FCM Push Notification
   if (targetUserIds.length > 0) {
     sendFcmPush(targetUserIds, title, body, notificationData).catch((err) => {
       console.error('[POAlarmService] Error dispatching push:', err.message);
@@ -155,18 +178,17 @@ async function triggerPoAlarm({
       source: triggeredBy,
       title,
       message: body,
-      status: 'active',
+      status: 'SENT',
       timestamp: nowIso,
     };
 
     io.emit('po:alarm', socketPayload);
     io.emit('new_notification', socketPayload);
-    console.log(`[POAlarmService] 📡 Broadcasted live PO Alarm for ${formattedPo} to ${targetUserIds.length} users.`);
+    console.log(`[POAlarmService] 📡 Broadcasted live PO Alarm for ${formattedPo} (SENT) to ${targetUserIds.length} users.`);
   }
 
-  // Also log audit trail
   logAudit({
-    eventType: 'PO_ALARM_TRIGGERED',
+    eventType: 'PO_ALARM_SENT',
     lotNumber: formattedPo,
     details: { eventId, poNumber: formattedPo, supplier: displaySupplier, amount: displayAmount },
   }).catch(() => {});
@@ -183,9 +205,44 @@ async function triggerPoAlarm({
 }
 
 /**
+ * Mark Alert as DELIVERED (Confirmed by recipient device)
+ */
+async function markPoAlarmDelivered(eventId, poNumber) {
+  if (!eventId && !poNumber) return false;
+
+  try {
+    let queryWhere = '';
+    let params = [];
+
+    if (eventId) {
+      queryWhere = 'event_id = ?';
+      params = [eventId];
+    } else {
+      queryWhere = 'po_number = ? AND status = "SENT"';
+      params = [poNumber];
+    }
+
+    const [res] = await pool.query(
+      `UPDATE po_alarm_events_app 
+       SET status = 'DELIVERED', delivered_at = NOW()
+       WHERE ${queryWhere} AND status = 'SENT'`,
+      params
+    );
+
+    if (res.affectedRows > 0) {
+      console.log(`[POAlarmService] 📬 Confirmed delivery: ${poNumber || eventId} -> DELIVERED`);
+    }
+    return true;
+  } catch (err) {
+    console.warn('[POAlarmService] Error marking delivered:', err.message);
+    return false;
+  }
+}
+
+/**
  * STOP ALARM Functionality:
  * Immediately stops alarm sound, dismisses active notification,
- * updates backend status to 'stopped', and ensures PO is NEVER deleted or modified.
+ * updates status to 'STOPPED', and ensures PO is NEVER deleted or modified.
  */
 async function stopPoAlarm({ eventId, poNumber, userId, userName }) {
   if (!eventId && !poNumber) return { ok: false, error: 'eventId or poNumber is required' };
@@ -198,13 +255,13 @@ async function stopPoAlarm({ eventId, poNumber, userId, userName }) {
       queryWhere = 'event_id = ?';
       params = [userId, userName, eventId];
     } else {
-      queryWhere = 'po_number = ? AND status = "active"';
+      queryWhere = 'po_number = ? AND status IN ("SENT", "DELIVERED", "PENDING")';
       params = [userId, userName, poNumber];
     }
 
     const [result] = await pool.query(
       `UPDATE po_alarm_events_app 
-       SET status = 'stopped',
+       SET status = 'STOPPED',
            stopped_by_user_id = ?,
            stopped_by_user_name = ?,
            stopped_at = NOW()
@@ -233,7 +290,7 @@ async function stopPoAlarm({ eventId, poNumber, userId, userName }) {
       details: { eventId, poNumber },
     }).catch(() => {});
 
-    return { ok: true, stopped: true, eventId, poNumber };
+    return { ok: true, stopped: true, eventId, poNumber, status: 'STOPPED' };
   } catch (err) {
     console.error('[POAlarmService] Error stopping alarm:', err.message);
     return { ok: false, error: err.message };
@@ -242,26 +299,27 @@ async function stopPoAlarm({ eventId, poNumber, userId, userName }) {
 
 /**
  * OPEN PO Functionality:
- * Marks PO alarm as opened by user
+ * Marks PO alarm as OPENED by user
  */
 async function openPoAlarm({ eventId, poNumber, userId, userName }) {
   try {
+    let queryWhere = '';
+    let params = [];
+
     if (eventId) {
-      await pool.query(
-        `UPDATE po_alarm_events_app 
-         SET status = 'opened', opened_by_user_id = ?, opened_at = NOW()
-         WHERE event_id = ?`,
-        [userId, eventId]
-      );
-    } else if (poNumber) {
-      await pool.query(
-        `UPDATE po_alarm_events_app 
-         SET status = 'opened', opened_by_user_id = ?, opened_at = NOW()
-         WHERE po_number = ? AND status IN ('active', 'stopped')
-         ORDER BY id DESC LIMIT 1`,
-        [userId, poNumber]
-      );
+      queryWhere = 'event_id = ?';
+      params = [userId, eventId];
+    } else {
+      queryWhere = 'po_number = ? AND status IN ("SENT", "DELIVERED", "STOPPED", "PENDING")';
+      params = [userId, poNumber];
     }
+
+    await pool.query(
+      `UPDATE po_alarm_events_app 
+       SET status = 'OPENED', opened_by_user_id = ?, opened_at = NOW()
+       WHERE ${queryWhere}`,
+      params
+    );
 
     logAudit({
       eventType: 'PO_ALARM_OPENED',
@@ -271,10 +329,29 @@ async function openPoAlarm({ eventId, poNumber, userId, userName }) {
       details: { eventId, poNumber },
     }).catch(() => {});
 
-    return { ok: true };
+    return { ok: true, status: 'OPENED' };
   } catch (err) {
     console.warn('[POAlarmService] Error recording open action:', err.message);
     return { ok: false };
+  }
+}
+
+/**
+ * Retrieve pending unexpired alarms for offline reconnection
+ */
+async function getPendingAlarmsForUser(userId) {
+  try {
+    const [rows] = await pool.query(
+      `SELECT event_id AS eventId, po_number AS poNumber, supplier_name AS supplierName,
+              amount, received_at AS receivedAt, status, expires_at AS expiresAt
+       FROM po_alarm_events_app
+       WHERE status IN ('SENT', 'DELIVERED', 'PENDING') AND (expires_at IS NULL OR expires_at > NOW())
+       ORDER BY id DESC LIMIT 5`
+    );
+    return rows;
+  } catch (err) {
+    console.warn('[POAlarmService] Error fetching pending alarms:', err.message);
+    return [];
   }
 }
 
@@ -388,9 +465,19 @@ async function sendTestPoAlarm(userId, userName = 'Tester') {
     isEmergencyAlarm: 'true',
     actions: JSON.stringify([
       { id: 'OPEN_PO', title: 'OPEN PO' },
-      { id: 'STOP_ALARM', title: 'STOP ALARM' },
+      { id: 'STOP_ALARM', title: 'STOP' },
     ]),
   };
+
+  // Record test alarm
+  try {
+    await pool.query(
+      `INSERT INTO po_alarm_events_app 
+         (event_id, po_number, supplier_name, amount, recipient_user_id, received_at, sent_at, expires_at, status)
+       VALUES (?, ?, ?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 60 SECOND), 'SENT')`,
+      [eventId, testPoNumber, displaySupplier, displayAmount, userId]
+    );
+  } catch {}
 
   // 1. Send direct FCM push to user
   const pushRes = await sendFcmPush([userId], title, body, payload);
@@ -413,7 +500,7 @@ async function sendTestPoAlarm(userId, userName = 'Tester') {
       source: 'Test Trigger',
       title,
       message: body,
-      status: 'active',
+      status: 'SENT',
       timestamp: nowIso,
     });
   }
@@ -433,6 +520,9 @@ module.exports = {
   triggerPoAlarm,
   stopPoAlarm,
   openPoAlarm,
+  markPoAlarmDelivered,
+  getPendingAlarmsForUser,
+  checkAndExpireAlarms,
   getUserNotificationSettings,
   updateUserNotificationSettings,
   sendTestPoAlarm,
