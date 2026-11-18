@@ -25,10 +25,12 @@ module.exports = {
     email: z.string().trim().toLowerCase().email(),
     password: z.string().min(1).max(100).optional(),
     role: z.enum(['admin', 'supervisor', 'gate', 'store', 'user']).default('supervisor'),
+    department: z.string().trim().max(100).nullable().optional(),
     secretKey: z.string().optional(),
     adminSecretKey: z.string().optional(),
   }),
   role: z.object({ role: z.enum(['admin', 'supervisor', 'gate', 'store', 'user']) }),
+  department: z.object({ department: z.string().trim().max(100).nullable().optional() }),
   active: z.object({ isActive: z.boolean() }),
   status,
 };

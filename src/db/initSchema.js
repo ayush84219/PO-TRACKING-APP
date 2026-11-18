@@ -32,6 +32,7 @@ async function initSchema() {
         plain_password VARCHAR(100) NULL,
         role ENUM('admin','user','supervisor','gate','store') NOT NULL DEFAULT 'user',
         base_role ENUM('admin','supervisor','gate','store','user') NULL,
+        department VARCHAR(100) NULL,
         app_name VARCHAR(100) NULL,
         is_active TINYINT(1) NOT NULL DEFAULT 1,
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -375,6 +376,14 @@ async function initSchema() {
     try {
       await conn.query(`ALTER TABLE user_app ADD COLUMN plain_password VARCHAR(100) NULL`);
     } catch {}
+
+    // Ensure department column exists on user_app (packing, stitching, overlock, store, cutting, kaagbutton, washing)
+    try {
+      await conn.query(`ALTER TABLE user_app ADD COLUMN department VARCHAR(100) NULL`);
+    } catch {}
+
+    // Populate default department for store role if not set
+    await conn.query(`UPDATE user_app SET department = 'store' WHERE (role = 'store' OR base_role = 'store') AND department IS NULL`).catch(() => {});
 
     // Populate default passwords if plain_password is null
     await conn.query(`UPDATE user_app SET plain_password = 'AdminPassword123!' WHERE (role = 'admin' OR base_role = 'admin') AND plain_password IS NULL`).catch(() => {});

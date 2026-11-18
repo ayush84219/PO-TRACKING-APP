@@ -9,13 +9,14 @@ router.use(authenticate, requireRole('admin'));
 
 router.get('/', wrap(async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT u.id, u.name, u.email, u.role, u.is_active AS isActive, u.created_at AS createdAt,
+    `SELECT u.id, u.name, u.email, u.role, u.department, u.is_active AS isActive, u.created_at AS createdAt,
             COALESCE(u.plain_password, 'SupervisorPassword123!') AS plainPassword,
             (SELECT COUNT(*) FROM scans_app s WHERE s.scanned_by = u.id) AS scanCount
      FROM user_app u ORDER BY u.created_at DESC`);
   res.json({
     items: rows.map(r => ({
       ...r,
+      department: r.department || null,
       isActive: !!r.isActive,
       scanCount: +r.scanCount,
       plainPassword: r.plainPassword,
@@ -28,6 +29,9 @@ router.post('/', wrap(async (req, res) => {
   const name = parsed.name.trim();
   const email = parsed.email.trim().toLowerCase();
   const role = parsed.role || 'supervisor';
+  const department = (parsed.department && String(parsed.department).trim())
+    ? String(parsed.department).trim().toLowerCase()
+    : (role === 'store' ? 'store' : null);
 
   // If creating an Admin account, require and verify the ADMIN_SECRET_KEY from .env
   if (role === 'admin') {
@@ -56,8 +60,8 @@ router.post('/', wrap(async (req, res) => {
   const hash = await bcrypt.hash(rawPassword, 10);
 
   const [result] = await pool.query(
-    'INSERT INTO user_app (name, email, password_hash, role, base_role, is_active, plain_password) VALUES (?, ?, ?, ?, ?, 1, ?)',
-    [name, email, hash, role, role, rawPassword]
+    'INSERT INTO user_app (name, email, password_hash, role, base_role, department, is_active, plain_password) VALUES (?, ?, ?, ?, ?, ?, 1, ?)',
+    [name, email, hash, role, role, department, rawPassword]
   );
 
   res.status(201).json({
@@ -67,6 +71,7 @@ router.post('/', wrap(async (req, res) => {
       name,
       email,
       role,
+      department,
       isActive: true,
       scanCount: 0,
       createdAt: new Date().toISOString(),
@@ -117,6 +122,17 @@ router.patch('/:id/role', wrap(async (req, res) => {
   const [r] = await pool.query('UPDATE user_app SET role = ? WHERE id = ?', [role, id]);
   if (!r.affectedRows) throw new AppError(404, 'User not found', 'not_found');
   res.json({ ok: true });
+}));
+
+router.patch('/:id/department', wrap(async (req, res) => {
+  const parsed = S.department.parse(req.body);
+  const department = (parsed.department && String(parsed.department).trim())
+    ? String(parsed.department).trim().toLowerCase()
+    : null;
+  const id = parseInt(req.params.id);
+  const [r] = await pool.query('UPDATE user_app SET department = ? WHERE id = ?', [department, id]);
+  if (!r.affectedRows) throw new AppError(404, 'User not found', 'not_found');
+  res.json({ ok: true, department });
 }));
 
 router.patch('/:id/active', wrap(async (req, res) => {
