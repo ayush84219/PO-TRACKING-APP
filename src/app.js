@@ -21,6 +21,7 @@ app.use('/dashboard', require('./routes/dashboard'));
 app.use('/users', require('./routes/users'));
 app.use('/notifications', require('./routes/notifications'));
 app.use('/components', require('./routes/components'));
+app.use('/complaints', require('./routes/complaints'));
 app.use(notFound);
 app.use(handler);
 module.exports = app;

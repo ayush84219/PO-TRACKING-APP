@@ -1,8 +1,9 @@
 const pool = require('../db/pool');
 const { sendPush } = require('./push');
 const { enqueueNotification } = require('./notificationQueue');
-const { getIO } = require('./socketService');
+const { getIO, emitToUsers } = require('./socketService');
 const { triggerPoAlarm } = require('./poAlarmService');
+const { resolveSupervisorUsers, getUsersByRole } = require('./userDirectory');
 
 let watcherTimer = null;
 let isChecking = false;
@@ -139,31 +140,15 @@ async function checkNewPurchaseOrders() {
             : `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`);
       const poBaseMsg = `New ${poTypeLabel} No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival at gate.`;
 
-      // 4. Target Security (Gate), Admin, and ONLY the Specific Assigned Supervisor
-      const poTargetUsers = allUsers.filter((u) => {
-        const isGate = u.role === 'gate' || u.base_role === 'gate';
-        const isAdmin = u.role === 'admin' || u.base_role === 'admin';
-        if (isGate || isAdmin) return true;
-
-        const isSupervisor = u.role === 'supervisor' || u.base_role === 'supervisor';
-        if (isSupervisor) {
-          if (assignedSupervisor) {
-            const supTarget = String(assignedSupervisor).trim().toLowerCase();
-            const uName = String(u.name || '').trim().toLowerCase();
-            const uEmail = String(u.email || '').trim().toLowerCase();
-            return uName.includes(supTarget) || supTarget.includes(uName) || uEmail.includes(supTarget);
-          }
-          return true;
-        }
-        return false;
+      // 4. Target Security (Gate) and ONLY the Specific Assigned Supervisor (NEVER Admin, NEVER other Supervisors)
+      const gateUsers = await getUsersByRole(['gate']);
+      const matchedSups = await resolveSupervisorUsers(assignedSupervisor);
+      const poTargetMap = new Map();
+      [...gateUsers, ...matchedSups].forEach((u) => {
+        const uid = u.user_id || u.id;
+        poTargetMap.set(uid, { ...u, id: uid });
       });
-
-      // Fallback: if assigned supervisor didn't match any registered user, pick first supervisor so alert is delivered
-      const hasSupervisorTarget = poTargetUsers.some(u => u.role === 'supervisor' || u.base_role === 'supervisor');
-      if (!hasSupervisorTarget && supervisors.length > 0) {
-        poTargetUsers.push(supervisors[0]);
-      }
-
+      const poTargetUsers = Array.from(poTargetMap.values());
       const poTargetIds = poTargetUsers.map(u => u.id);
 
       for (const u of poTargetUsers) {
@@ -230,30 +215,25 @@ async function checkNewPurchaseOrders() {
           }
         );
 
-        // Emit continuous in-app siren alarm to Gate and Supervisor panels
-        const activeIo = getIO();
-        if (activeIo) {
-          activeIo
-            .to('gate-notifications')
-            .to('supervisor-notifications')
-            .to('admin-notifications')
-            .emit('new_notification', {
-              eventId: `EVT-ALARM-PO-${cleanDigits}-${Date.now()}`,
-              eventType: 'MATERIAL_STANDBY_ALARM',
-              isEmergencyAlarm: true,
-              billNumber: formattedPo,
-              lotNo,
-              supplierName: vendor,
-              materialDetails: `${itemsSummary} (${totalQty} ${unit})`,
-              scannerName: assignedSupervisor,
-              scanTime: new Date().toISOString(),
-              billId: formattedPo,
-              source: 'PO Standby Alarm',
-              title: standbyAlarmTitle,
-              message: standbyAlarmBody,
-              status: 'pending',
-              timestamp: new Date().toISOString(),
-            });
+        // Emit continuous in-app siren alarm ONLY to targeted Gate & Assigned Supervisor user IDs
+        if (poTargetIds.length > 0) {
+          emitToUsers(poTargetIds, 'new_notification', {
+            eventId: `EVT-ALARM-PO-${cleanDigits}-${Date.now()}`,
+            eventType: 'MATERIAL_STANDBY_ALARM',
+            isEmergencyAlarm: true,
+            billNumber: formattedPo,
+            lotNo,
+            supplierName: vendor,
+            materialDetails: `${itemsSummary} (${totalQty} ${unit})`,
+            scannerName: assignedSupervisor,
+            scanTime: new Date().toISOString(),
+            billId: formattedPo,
+            source: 'PO Standby Alarm',
+            title: standbyAlarmTitle,
+            message: standbyAlarmBody,
+            status: 'pending',
+            timestamp: new Date().toISOString(),
+          });
         }
       }, 15000); // 15-second alarm trigger!
 

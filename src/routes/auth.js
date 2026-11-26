@@ -6,6 +6,7 @@ const S = require('../validators/schemas');
 const { wrap, AppError } = require('../middleware/errors');
 const { authenticate } = require('../middleware/auth');
 const { sha, tokenPair, refreshSecret } = require('../services/tokens');
+const { syncUserDetails } = require('../services/userDirectory');
 
 const pub = (u) => ({
   id: u.id,
@@ -37,6 +38,7 @@ router.post('/register', wrap(async (req, res) => {
     'INSERT INTO user_app (name, email, password_hash, role, base_role, plain_password) VALUES (?,?,?,?,?,?)',
     [name, email, hash, userRole, userRole, password]
   );
+  await syncUserDetails(r.insertId);
   const user = { id: r.insertId, name, email, role: userRole, baseRole: userRole };
   res.status(201).json({ user: pub(user), ...(await tokenPair(user)) });
 }));
@@ -88,6 +90,7 @@ router.post('/switch-role', authenticate, wrap(async (req, res) => {
     throw new AppError(403, 'Only administrators can switch to admin panel', 'forbidden');
   }
   await pool.query('UPDATE user_app SET role = ? WHERE id = ?', [role, req.user.id]);
+  await syncUserDetails(req.user.id);
   const updated = { ...u, role, base_role: baseRole };
   res.json({ user: pub(updated), ...(await tokenPair(updated)) });
 }));

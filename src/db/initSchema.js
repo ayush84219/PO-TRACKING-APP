@@ -495,6 +495,58 @@ async function initSchema() {
     await conn.query("DELETE FROM scans_app WHERE lot_number LIKE 'LOT-%' OR lot_number LIKE 'T-%' OR lot_number LIKE 'N-%' OR lot_number LIKE 'PO-LOT-%' OR lot_number LIKE 'PO-N-%' OR lot_number LIKE 'PO-880%'").catch(() => {});
     await conn.query("DELETE FROM materials_app WHERE lot_number LIKE 'LOT-%' OR lot_number LIKE 'PO-880%' OR lot_number LIKE 'T-%' OR lot_number LIKE 'N-%' OR lot_number LIKE 'PO-LOT-%' OR lot_number LIKE 'PO-N-%'").catch(() => {});
 
+    // user_details_app: Master directory storing user ID, name, email, role, base_role, department for ID-based targeted notifications & alarms
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS user_details_app (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL UNIQUE,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(190) NOT NULL,
+        role ENUM('admin','user','supervisor','gate','store') NOT NULL DEFAULT 'user',
+        base_role ENUM('admin','supervisor','gate','store','user') NULL,
+        department VARCHAR(100) NULL,
+        is_active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_uda_user_id (user_id),
+        INDEX idx_uda_role (role),
+        INDEX idx_uda_name (name),
+        FOREIGN KEY (user_id) REFERENCES user_app(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    // Backfill/sync all existing users from user_app into user_details_app
+    await conn.query(`
+      INSERT INTO user_details_app (user_id, name, email, role, base_role, department, is_active)
+      SELECT id, name, email, role, base_role, department, is_active FROM user_app
+      ON DUPLICATE KEY UPDATE
+        name = VALUES(name),
+        email = VALUES(email),
+        role = VALUES(role),
+        base_role = VALUES(base_role),
+        department = VALUES(department),
+        is_active = VALUES(is_active);
+    `).catch((e) => console.warn('[DB Schema] user_details_app backfill warning:', e.message));
+
+    // complaints_app: Persistent Query Box / Issue reports that notify Admin
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS complaints_app (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        po_number VARCHAR(100) NOT NULL,
+        lot_number VARCHAR(100) NULL,
+        reporter_id INT NULL,
+        reporter_name VARCHAR(100) NOT NULL,
+        supervisor_name VARCHAR(100) NULL,
+        issue_category VARCHAR(150) NOT NULL,
+        comment TEXT NOT NULL,
+        status ENUM('open','in_review','resolved') NOT NULL DEFAULT 'open',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_comp_po (po_number),
+        INDEX idx_comp_status (status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
     console.log('[DB Schema] Dedicated MaterialScan application schema verified successfully (Clean production mode - No demo data).');
   } catch (err) {
     console.error('[DB Schema] Migration error:', err.message);

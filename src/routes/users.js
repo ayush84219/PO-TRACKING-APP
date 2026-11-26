@@ -4,8 +4,15 @@ const pool = require('../db/pool');
 const S = require('../validators/schemas');
 const { wrap, AppError } = require('../middleware/errors');
 const { authenticate, requireRole } = require('../middleware/auth');
+const { syncUserDetails, getAllUserDetails } = require('../services/userDirectory');
 
 router.use(authenticate, requireRole('admin'));
+
+// GET /users/details - Show all users' IDs and their roles from user_details_app
+router.get('/details', wrap(async (req, res) => {
+  const items = await getAllUserDetails({ activeOnly: false });
+  res.json({ items });
+}));
 
 router.get('/', wrap(async (req, res) => {
   const [rows] = await pool.query(
@@ -64,6 +71,8 @@ router.post('/', wrap(async (req, res) => {
     [name, email, hash, role, role, department, rawPassword]
   );
 
+  await syncUserDetails(result.insertId);
+
   res.status(201).json({
     ok: true,
     user: {
@@ -121,6 +130,7 @@ router.patch('/:id/role', wrap(async (req, res) => {
   if (id === req.user.id) throw new AppError(400, "You can't change your own role", 'invalid');
   const [r] = await pool.query('UPDATE user_app SET role = ? WHERE id = ?', [role, id]);
   if (!r.affectedRows) throw new AppError(404, 'User not found', 'not_found');
+  await syncUserDetails(id);
   res.json({ ok: true });
 }));
 
@@ -132,6 +142,7 @@ router.patch('/:id/department', wrap(async (req, res) => {
   const id = parseInt(req.params.id);
   const [r] = await pool.query('UPDATE user_app SET department = ? WHERE id = ?', [department, id]);
   if (!r.affectedRows) throw new AppError(404, 'User not found', 'not_found');
+  await syncUserDetails(id);
   res.json({ ok: true, department });
 }));
 
@@ -142,6 +153,7 @@ router.patch('/:id/active', wrap(async (req, res) => {
   const [r] = await pool.query('UPDATE user_app SET is_active = ? WHERE id = ?', [isActive ? 1 : 0, id]);
   if (!r.affectedRows) throw new AppError(404, 'User not found', 'not_found');
   if (!isActive) await pool.query('UPDATE refresh_tokens_app SET revoked = 1 WHERE user_id = ?', [id]);
+  await syncUserDetails(id);
   res.json({ ok: true });
 }));
 

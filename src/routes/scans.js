@@ -13,6 +13,7 @@ const {
   sendGenericScanNotification,
 } = require('../services/socketService');
 const { binarySearchService } = require('../services/binarySearchService');
+const { getUsersByRole, resolveSupervisorUsers } = require('../services/userDirectory');
 
 router.use(authenticate);
 
@@ -520,59 +521,57 @@ router.post('/', wrap(async (req, res) => {
       details: { scanId, materialId, materialName, status, note, scanStage, rescanned },
     });
 
-    // Lookup Assigned Supervisor for targeted alarm & notification routing
-    let assignedSupervisorName = null;
-    try {
-      const cleanDigits = docLot.replace(/[^0-9]/g, '');
-      const [supRow] = await pool.query(
-        "SELECT supervisor FROM supervisor_details_app WHERE lot_number IN (?, ?, ?) LIMIT 1",
-        [cleanDigits, docLot, docLot.replace(/^PO-/, '')]
-      );
-      if (supRow.length && supRow[0].supervisor) {
-        assignedSupervisorName = supRow[0].supervisor;
+    // Lookup Assigned Supervisor for targeted alarm & notification routing (from request, binarySearch index, or DB)
+    let assignedSupervisorName = (req.body.supervisorName || req.body.assignedSupervisor || '').trim() || null;
+    if (!assignedSupervisorName && binarySearchService.isWarmedUp) {
+      const fastDoc = binarySearchService.lookupFast(docLot);
+      if (fastDoc && fastDoc.supervisor) {
+        assignedSupervisorName = String(fastDoc.supervisor).trim();
       }
-    } catch {}
+    }
+    if (!assignedSupervisorName) {
+      try {
+        const cleanDigits = docLot.replace(/[^0-9]/g, '');
+        const [supRow] = await pool.query(
+          "SELECT supervisor FROM supervisor_details_app WHERE lot_number IN (?, ?, ?) LIMIT 1",
+          [cleanDigits, docLot, docLot.replace(/^PO-/, '')]
+        );
+        if (supRow.length && supRow[0].supervisor) {
+          assignedSupervisorName = supRow[0].supervisor;
+        }
+      } catch {}
+    }
 
-    const [allAdmins] = await pool.query(
-      "SELECT id, name, role FROM user_app WHERE (role = 'admin' OR base_role = 'admin') AND is_active = 1"
-    );
+    // Resolve ONLY the specific supervisor assigned to this lot via user_details_app (never other supervisors!)
+    const targetSups = await resolveSupervisorUsers(assignedSupervisorName, null, { excludeUserId: me.id });
+    const allAdmins = await getUsersByRole(['admin'], { excludeUserId: me.id });
 
     // =========================================================================
     // DISPATCH NOTIFICATIONS FOR ALL SCAN STAGES (FCM + In-App)
     // =========================================================================
     if (scanStage === 'GATE_OUT') {
-      // 1. RGP Stage 1: Gate Out Dispatch
+      // 1. RGP Stage 1: Gate Out Dispatch (Assigned Supervisor ONLY — NO Admin, NO other Supervisors)
       const notifTitle = `📤 RGP Material Dispatched (${docLot})`;
       const notifMessage = `${materialName || 'RGP'} (${docLot}) dispatched through Factory Gate by ${me.name}.`;
+      const targets = targetSups;
+      const targetIds = targets.map(s => s.id);
 
-      // Real-time Emergency Alarm dispatched to all recipient panels
       sendGateScanNotification({
         eventId,
         billNumber: docLot,
         supplierName: poVendor,
         materialDetails: materialName || 'RGP Material',
         scannerName: me.name,
+        scannerId: me.id,
         scanTime: new Date().toISOString(),
         billId: materialId,
         title: notifTitle,
         message: notifMessage,
         source: 'Gate',
         isEmergencyAlarm: true,
+        targetUserIds: targetIds,
+        assignedSupervisor: assignedSupervisorName,
       });
-
-      const [sups] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE (role = 'supervisor' OR base_role = 'supervisor') AND is_active = 1"
-      );
-      let targetSups = sups;
-      if (assignedSupervisorName) {
-        const supKey = assignedSupervisorName.trim().toLowerCase();
-        const matched = sups.filter(s => (s.name || '').toLowerCase().includes(supKey) || supKey.includes((s.name || '').toLowerCase()));
-        if (matched.length > 0) targetSups = matched;
-      }
-
-      const recipientMap = new Map();
-      [...targetSups, ...allAdmins].forEach(u => recipientMap.set(u.id, u));
-      const targets = Array.from(recipientMap.values());
 
       for (const target of targets) {
         await enqueueNotification({
@@ -585,19 +584,18 @@ router.post('/', wrap(async (req, res) => {
           payload: { eventId, lotNumber: docLot, materialName, gateOfficerName: me.name, type: 'rgp_gate_out' },
         }).catch(() => {});
       }
-      if (targets.length > 0) {
-        sendPush(targets.map(s => s.id), notifTitle, notifMessage, { lotNumber: docLot, eventId, type: 'rgp_gate_out' });
+      if (targetIds.length > 0) {
+        sendPush(targetIds, notifTitle, notifMessage, { lotNumber: docLot, eventId, type: 'rgp_gate_out', isEmergencyAlarm: true });
       }
 
     } else if (isGateScan || scanStage === 'GATE_INWARD' || scanStage === 'GATE_IN') {
-      // 2. PO Step 1 Gate Inward OR RGP Step 2 Gate In (Material Gate Par Aa Gya)
+      // 2. PO Step 1 Gate Inward OR RGP Step 2 Gate In
+      // Targets: Store + ONLY the Specific Assigned Supervisor (NO Admin, NO other Supervisors!)
       const isPartial = status === 'pending';
       const isRgpItem = isRgp || scanStage === 'GATE_IN';
-      const notifTitle = isRgpItem
-        ? (isPartial ? `⚠️ Half Material Received in Gate (${docLot})` : `🚨 Successfully Received Material in Gate (${docLot})`)
-        : (isPartial
-            ? `⚠️ Half Material Received in Gate (${docLot})`
-            : `🚨 Successfully Received Material in Gate (${docLot})`);
+      const notifTitle = isPartial
+        ? `⚠️ Half Material Received in Gate (${docLot})`
+        : `🚨 Successfully Received Material in Gate (${docLot})`;
 
       const supNote = assignedSupervisorName ? ` | Assigned: ${assignedSupervisorName}` : '';
       const notifMessage = isRgpItem
@@ -608,7 +606,15 @@ router.post('/', wrap(async (req, res) => {
             ? `Half material received in gate (Partial delivery). PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Waiting for remaining delivery.`
             : `Successfully received material in gate. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Ready for Store collection.`);
 
-      // Real-time Socket.IO notification immediately delivered to Store Person and Supervisor
+      const stores = isRgpItem ? [] : await getUsersByRole(['store'], { excludeUserId: me.id });
+      const recipientMap = new Map();
+      [...stores, ...targetSups].forEach(u => {
+        if (u.id !== me.id) recipientMap.set(u.id, u);
+      });
+      const targets = Array.from(recipientMap.values());
+      const targetIds = targets.map(s => s.id);
+
+      // Real-time Socket.IO notification immediately delivered ONLY to targeted user IDs
       sendGateScanNotification({
         eventId,
         billNumber: docLot,
@@ -622,29 +628,9 @@ router.post('/', wrap(async (req, res) => {
         message: notifMessage,
         source: 'Gate',
         isEmergencyAlarm: true,
+        targetUserIds: targetIds,
+        assignedSupervisor: assignedSupervisorName,
       });
-
-      const [sups] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE (role = 'supervisor' OR base_role = 'supervisor') AND is_active = 1 AND id != ?",
-        [me.id]
-      );
-      let targetSups = sups;
-      if (assignedSupervisorName) {
-        const supKey = assignedSupervisorName.trim().toLowerCase();
-        const matched = sups.filter(s => (s.name || '').toLowerCase().includes(supKey) || supKey.includes((s.name || '').toLowerCase()));
-        if (matched.length > 0) targetSups = matched;
-      }
-
-      const [stores] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE (role = 'store' OR base_role = 'store') AND is_active = 1 AND id != ?",
-        [me.id]
-      );
-
-      const recipientMap = new Map();
-      [...stores, ...targetSups, ...allAdmins].forEach(u => {
-        if (u.id !== me.id) recipientMap.set(u.id, u);
-      });
-      const targets = Array.from(recipientMap.values());
 
       for (const target of targets) {
         await enqueueNotification({
@@ -671,8 +657,8 @@ router.post('/', wrap(async (req, res) => {
         }).catch(() => {});
       }
 
-      if (targets.length > 0) {
-        sendPush(targets.map(s => s.id), notifTitle, notifMessage, {
+      if (targetIds.length > 0) {
+        sendPush(targetIds, notifTitle, notifMessage, {
           lotNumber: docLot,
           eventId,
           type: 'gate_arrival',
@@ -682,11 +668,20 @@ router.post('/', wrap(async (req, res) => {
 
     } else if (isStoreScan || scanStage === 'STORE_INWARD') {
       // Step 2: Store Inward & Collection from Gate
+      // Targets: Gate + ONLY the Specific Assigned Supervisor (NO Admin, NO other Supervisors!)
       const supNote = assignedSupervisorName ? ` | Assigned: ${assignedSupervisorName}` : '';
       const storeTitle = `📦 Successfully Received Material in Store (${docLot})`;
       const storeMessage = `Successfully received material in store. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Received by Store Officer ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Please verify the bill.`;
 
-      // Real-time Socket.IO notification immediately delivered to Supervisor
+      const gates = await getUsersByRole(['gate'], { excludeUserId: me.id });
+      const recipientMap = new Map();
+      [...targetSups, ...gates].forEach(u => {
+        if (u.id !== me.id) recipientMap.set(u.id, u);
+      });
+      const targets = Array.from(recipientMap.values());
+      const targetIds = targets.map(s => s.id);
+
+      // Real-time Socket.IO notification immediately delivered ONLY to targeted user IDs
       sendStoreScanNotification({
         eventId,
         billNumber: docLot,
@@ -700,29 +695,9 @@ router.post('/', wrap(async (req, res) => {
         title: storeTitle,
         message: storeMessage,
         isEmergencyAlarm: true,
+        targetUserIds: targetIds,
+        assignedSupervisor: assignedSupervisorName,
       });
-
-      const [sups] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE (role = 'supervisor' OR base_role = 'supervisor') AND is_active = 1 AND id != ?",
-        [me.id]
-      );
-      let targetSups = sups;
-      if (assignedSupervisorName) {
-        const supKey = assignedSupervisorName.trim().toLowerCase();
-        const matched = sups.filter(s => (s.name || '').toLowerCase().includes(supKey) || supKey.includes((s.name || '').toLowerCase()));
-        if (matched.length > 0) targetSups = matched;
-      }
-
-      const [gates] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE (role = 'gate' OR base_role = 'gate') AND is_active = 1 AND id != ?",
-        [me.id]
-      );
-
-      const recipientMap = new Map();
-      [...targetSups, ...gates, ...allAdmins].forEach(u => {
-        if (u.id !== me.id) recipientMap.set(u.id, u);
-      });
-      const targets = Array.from(recipientMap.values());
 
       for (const target of targets) {
         await enqueueNotification({
@@ -748,8 +723,8 @@ router.post('/', wrap(async (req, res) => {
         }).catch(() => {});
       }
 
-      if (targets.length > 0) {
-        sendPush(targets.map(s => s.id), storeTitle, storeMessage, {
+      if (targetIds.length > 0) {
+        sendPush(targetIds, storeTitle, storeMessage, {
           lotNumber: docLot,
           eventId,
           type: 'store_inward',
@@ -758,7 +733,7 @@ router.post('/', wrap(async (req, res) => {
       }
 
     } else if (isSupervisorScan || scanStage === 'SUPERVISOR_PICKUP' || scanStage === 'SUPERVISOR_INWARD') {
-      // 3. Supervisor Step: PO Step 3 OR RGP Step 3
+      // 3. LAST STAGE: Supervisor Received Material -> Notify Gate, Store, AND send clean message to Admin (no alarm)
       await acknowledgeLot(docLot, me.id, me.name, me.role).catch(() => {});
 
       const isPartialReceipt = status === 'pending';
@@ -778,7 +753,18 @@ router.post('/', wrap(async (req, res) => {
             ? `Supervisor half received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Half/partial delivery verified & received by Supervisor ${me.name}. Waiting for remaining delivery.`
             : `Supervisor received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Complete material verified & PO officially CLOSED by Supervisor ${me.name}.`);
 
-      // Real-time Socket.IO notification to Gate, Store, and Admin
+      const gates = await getUsersByRole(['gate'], { excludeUserId: me.id });
+      const stores = await getUsersByRole(['store'], { excludeUserId: me.id });
+
+      const opsMap = new Map();
+      [...gates, ...stores].forEach(u => {
+        if (u.id !== me.id) opsMap.set(u.id, u);
+      });
+      const opsTargets = Array.from(opsMap.values());
+      const opsTargetIds = opsTargets.map(u => u.id);
+      const adminIds = allAdmins.map(a => a.id);
+
+      // Real-time Socket.IO: Gate & Store get stage update; Admin gets clean last-stage message (isEmergencyAlarm: false)
       sendSupervisorScanNotification({
         eventId,
         billNumber: docLot,
@@ -790,24 +776,13 @@ router.post('/', wrap(async (req, res) => {
         title: pickupTitle,
         message: pickupMessage,
         isEmergencyAlarm: true,
+        targetUserIds: opsTargetIds,
+        adminUserIds: adminIds,
       });
 
-      const [gates] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE (role = 'gate' OR base_role = 'gate') AND is_active = 1 AND id != ?",
-        [me.id]
-      );
-      const [stores] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE (role = 'store' OR base_role = 'store') AND is_active = 1 AND id != ?",
-        [me.id]
-      );
-
-      const recipientMap = new Map();
-      [...gates, ...stores, ...allAdmins].forEach(u => {
-        if (u.id !== me.id) recipientMap.set(u.id, u);
-      });
-      const targets = Array.from(recipientMap.values());
-
-      for (const target of targets) {
+      const allFinalTargets = [...opsTargets, ...allAdmins];
+      for (const target of allFinalTargets) {
+        const isAdminTarget = target.role === 'admin' || target.base_role === 'admin';
         await enqueueNotification({
           lotNumber: docLot,
           eventId,
@@ -826,22 +801,35 @@ router.post('/', wrap(async (req, res) => {
             receiptType: isPartialReceipt ? 'partial' : 'complete',
             type: 'supervisor_pickup',
             source: 'Supervisor',
+            isEmergencyAlarm: !isAdminTarget,
           },
         }).catch(() => {});
       }
 
-      if (targets.length > 0) {
-        sendPush(targets.map((g) => g.id), pickupTitle, pickupMessage, {
+      if (opsTargetIds.length > 0) {
+        sendPush(opsTargetIds, pickupTitle, pickupMessage, {
           lotNumber: docLot,
           type: 'supervisor_pickup',
           isEmergencyAlarm: true,
         });
       }
+      if (adminIds.length > 0) {
+        // Admin only receives a regular message (no alarm siren)
+        sendPush(adminIds, pickupTitle, pickupMessage, {
+          lotNumber: docLot,
+          type: 'supervisor_pickup',
+          isEmergencyAlarm: false,
+        });
+      }
     } else {
-      // Fallback for ANY other scan (custom lot, raw materials, admin scan, etc.)
-      // Guarantees that EVERY SINGLE SCAN triggers the emergency alarm and push notification!
+      // Fallback for ANY other scan: target assigned supervisor or operational staff (NO Admin!)
       const genTitle = `🚨 Material Scanned (${docLot})`;
       const genMessage = `Material ${docLot} (${materialName || 'Material'}) was scanned by ${me.name}.`;
+
+      const otherOps = targetSups.length > 0
+        ? targetSups
+        : await getUsersByRole(['gate', 'store'], { excludeUserId: me.id });
+      const targetIds = otherOps.map(u => u.id);
 
       sendGenericScanNotification({
         eventId,
@@ -853,13 +841,10 @@ router.post('/', wrap(async (req, res) => {
         message: genMessage,
         source: me.role === 'gate' ? 'Gate' : (me.role === 'store' ? 'Store' : 'Supervisor'),
         isEmergencyAlarm: true,
+        targetUserIds: targetIds,
       });
 
-      const [otherUsers] = await pool.query(
-        "SELECT id, name, role FROM user_app WHERE is_active = 1 AND id != ?",
-        [me.id]
-      );
-      for (const target of otherUsers) {
+      for (const target of otherOps) {
         await enqueueNotification({
           lotNumber: docLot,
           eventId,
@@ -877,8 +862,8 @@ router.post('/', wrap(async (req, res) => {
           },
         }).catch(() => {});
       }
-      if (otherUsers.length > 0) {
-        sendPush(otherUsers.map(u => u.id), genTitle, genMessage, { lotNumber: docLot, eventId, type: 'scan' });
+      if (targetIds.length > 0) {
+        sendPush(targetIds, genTitle, genMessage, { lotNumber: docLot, eventId, type: 'scan', isEmergencyAlarm: true });
       }
     }
 

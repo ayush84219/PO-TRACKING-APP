@@ -1,7 +1,8 @@
 const pool = require('../db/pool');
 const { sendFcmPush } = require('./fcmPush');
-const { getIO } = require('./socketService');
+const { getIO, emitToUsers } = require('./socketService');
 const { logAudit } = require('./auditLogger');
+const { resolveSupervisorUsers } = require('./userDirectory');
 
 /**
  * Format currency amount for PO display (e.g., ₹25,000)
@@ -96,53 +97,37 @@ async function triggerPoAlarm({
 
   const eventId = `EVT-PO-ALARM-${cleanDigits}-${Date.now()}`;
 
-  // 2. Query target users (Gate, Store, Supervisor, Admin) and check notification settings
+  // 2. Query target users (Gate, Store, and ONLY the Assigned Supervisor — NEVER Admin!)
   let targetUsers = [];
   try {
     const [users] = await pool.query(
-      `SELECT u.id, u.name, u.role, u.email,
+      `SELECT u.user_id AS id, u.name, u.role, u.base_role, u.email,
               COALESCE(s.po_alerts_enabled, 1) AS po_alerts_enabled,
               COALESCE(s.alarm_sound_enabled, 1) AS alarm_sound_enabled,
               COALESCE(s.alarm_tone, 'alarm_siren') AS alarm_tone,
               COALESCE(s.alarm_duration_sec, 30) AS alarm_duration_sec
-       FROM user_app u
-       LEFT JOIN user_notification_settings_app s ON s.user_id = u.id
+       FROM user_details_app u
+       LEFT JOIN user_notification_settings_app s ON s.user_id = u.user_id
        WHERE u.is_active = 1 AND (
-         u.role IN ('gate', 'store', 'supervisor', 'admin') OR
-         u.base_role IN ('gate', 'store', 'supervisor', 'admin')
+         u.role IN ('gate', 'store', 'supervisor') OR
+         u.base_role IN ('gate', 'store', 'supervisor')
        )`
     );
 
-    // Keep users who haven't disabled PO alerts
-    const activeEnabledUsers = users.filter((u) => u.po_alerts_enabled !== 0);
+    const activeEnabledUsers = users.filter((u) => u.po_alerts_enabled !== 0 && u.role !== 'admin' && u.base_role !== 'admin');
 
-    // Filter supervisors: if assignedSupervisor is specified, route ONLY to that specific supervisor!
-    targetUsers = activeEnabledUsers.filter((u) => {
+    // Non-supervisor operational roles (gate, store)
+    const gateStoreUsers = activeEnabledUsers.filter((u) => {
       const isSupervisor = (u.role === 'supervisor' || u.base_role === 'supervisor');
-      if (isSupervisor && (assignedSupervisor || assignedSupervisorId)) {
-        if (assignedSupervisorId && Number(u.id) === Number(assignedSupervisorId)) {
-          return true;
-        }
-        if (assignedSupervisor) {
-          const supTarget = String(assignedSupervisor).trim().toLowerCase();
-          const uName = String(u.name || '').trim().toLowerCase();
-          const uEmail = String(u.email || '').trim().toLowerCase();
-          return uName.includes(supTarget) || supTarget.includes(uName) || uEmail.includes(supTarget);
-        }
-        return false;
-      }
-      return true; // gate, store, admin always receive notification
+      return !isSupervisor;
     });
 
-    // If supervisor was assigned but no active supervisor matched by name, fallback to first active supervisor
-    const hasSupervisor = targetUsers.some((u) => u.role === 'supervisor' || u.base_role === 'supervisor');
-    if (!hasSupervisor && (assignedSupervisor || assignedSupervisorId)) {
-      const allActiveSups = activeEnabledUsers.filter((u) => u.role === 'supervisor' || u.base_role === 'supervisor');
-      if (allActiveSups.length > 0) {
-        console.warn(`[POAlarmService] ⚠️ No exact match for supervisor "${assignedSupervisor}". Alerting first available supervisor: ${allActiveSups[0].name} (ID: ${allActiveSups[0].id})`);
-        targetUsers.push(allActiveSups[0]);
-      }
-    }
+    // Resolve ONLY the specific assigned supervisor by ID/name from user_details_app
+    const matchedSups = await resolveSupervisorUsers(assignedSupervisor, assignedSupervisorId);
+    const matchedSupIds = new Set(matchedSups.map((s) => Number(s.user_id || s.id)));
+    const enabledMatchedSups = activeEnabledUsers.filter((u) => matchedSupIds.has(Number(u.id)));
+
+    targetUsers = [...gateStoreUsers, ...enabledMatchedSups];
   } catch (err) {
     console.error('[POAlarmService] Error querying target users:', err.message);
   }
@@ -193,9 +178,8 @@ async function triggerPoAlarm({
     });
   }
 
-  // 6. Broadcast Real-Time Socket.IO Event for In-App Alert Experience
-  const io = getIO();
-  if (io) {
+  // 6. Targeted Real-Time Socket.IO Event ONLY to targetUserIds (never Admin, never unrelated Supervisors)
+  if (targetUserIds.length > 0) {
     const socketPayload = {
       eventId,
       eventType: 'PO_ALARM',
@@ -209,15 +193,16 @@ async function triggerPoAlarm({
       designName: designName || '',
       materialDetails: items ? (typeof items === 'string' ? items : JSON.stringify(items)) : 'Materials Inward',
       source: triggeredBy,
+      assignedSupervisor: assignedSupervisor || '',
       title,
       message: body,
       status: 'SENT',
       timestamp: nowIso,
     };
 
-    io.emit('po:alarm', socketPayload);
-    io.emit('new_notification', socketPayload);
-    console.log(`[POAlarmService] 📡 Broadcasted live PO Alarm for ${formattedPo} (SENT) to ${targetUserIds.length} users.`);
+    emitToUsers(targetUserIds, 'po:alarm', socketPayload);
+    emitToUsers(targetUserIds, 'new_notification', socketPayload);
+    console.log(`[POAlarmService] 📡 Sent targeted PO Alarm for ${formattedPo} (SENT) to user IDs: [${targetUserIds.join(', ')}]`);
   }
 
   logAudit({

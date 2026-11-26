@@ -68,10 +68,8 @@ function joinUserRooms(socket, user) {
   } else if (role === 'supervisor') {
     socket.join('supervisor-notifications');
   } else if (role === 'admin') {
+    // Admin only joins admin-notifications & personal user room (never gate/store/supervisor alarm rooms)
     socket.join('admin-notifications');
-    socket.join('gate-notifications');
-    socket.join('store-notifications');
-    socket.join('supervisor-notifications');
   }
   console.log(`[Socket] 🟢 Joined rooms for: ${user.name} (Role: ${user.role}, ID: ${user.id}, Socket: ${socket.id})`);
 }
@@ -266,9 +264,9 @@ function joinUserRooms(socket, user) {
                  nq.title, nq.message, nq.payload, nq.status, nq.created_at AS createdAt,
                  nq.acknowledged_at AS acknowledgedAt, nq.acknowledged_by_name AS acknowledgedByName
           FROM notification_queue_app nq
-          WHERE (nq.user_id = ? OR nq.target_role = ? OR ? = 'admin')
+          WHERE (nq.user_id = ? OR (nq.user_id IS NULL AND nq.target_role = ?))
         `;
-        params.push(user.id, user.role, user.role);
+        params.push(user.id, user.role);
 
         if (lastSyncTime) {
           query += ` AND nq.created_at > ?`;
@@ -325,9 +323,20 @@ function joinUserRooms(socket, user) {
 }
 
 /**
+ * Emit a socket event ONLY to specific user IDs via their personal `user:<id>` rooms
+ */
+function emitToUsers(userIds, eventName, payload) {
+  if (!io || !Array.isArray(userIds) || userIds.length === 0) return;
+  const uniqueIds = [...new Set(userIds.filter(Boolean).map(Number))];
+  for (const uid of uniqueIds) {
+    io.to(`user:${uid}`).emit(eventName, payload);
+  }
+}
+
+/**
  * Stage 1: Send Gate Scan Notification
  * Sent when Gate Person scans the material bill.
- * Delivery targets: Store Person & Supervisor panels (and Admin)
+ * Delivery targets: Store Person & ONLY the specific assigned Supervisor (never Admin, never other Supervisors)
  */
 function sendGateScanNotification({
   eventId,
@@ -342,6 +351,8 @@ function sendGateScanNotification({
   message,
   source = 'Gate',
   isEmergencyAlarm = true,
+  targetUserIds = [],
+  assignedSupervisor = null,
 }) {
   if (!io) return;
 
@@ -353,6 +364,7 @@ function sendGateScanNotification({
     materialDetails: materialDetails || 'Material Lot',
     scannerName: scannerName || 'Gate Officer',
     scannerId: scannerId || null,
+    assignedSupervisor: assignedSupervisor || null,
     scanTime: scanTime || new Date().toISOString(),
     billId,
     source,
@@ -363,15 +375,13 @@ function sendGateScanNotification({
     timestamp: new Date().toISOString(),
   };
 
-  console.log(`[Socket] 📢 Emitting Stage 1 Gate Scan Alarm ${eventId} for Bill ${billNumber} to All Panels`);
-
-  // Send to Store Person room, Supervisor room, and Admin room, and broadcast globally to ensure delivery
-  io.to('store-notifications')
-    .to('supervisor-notifications')
-    .to('admin-notifications')
-    .emit('new_notification', payload);
-
-  io.emit('new_notification', payload);
+  if (Array.isArray(targetUserIds) && targetUserIds.length > 0) {
+    console.log(`[Socket] 📢 Emitting Stage 1 Gate Scan Alarm ${eventId} for Bill ${billNumber} ONLY to user IDs: [${targetUserIds.join(', ')}]`);
+    emitToUsers(targetUserIds, 'new_notification', payload);
+  } else {
+    console.log(`[Socket] 📢 Emitting Stage 1 Gate Scan Alarm ${eventId} for Bill ${billNumber} to Store room only (no supervisor matched)`);
+    io.to('store-notifications').emit('new_notification', payload);
+  }
 
   return payload;
 }
@@ -379,7 +389,7 @@ function sendGateScanNotification({
 /**
  * Stage 2: Send Store Scan Notification
  * Sent when Store Person scans the same bill.
- * Delivery targets: Supervisor panel (and Admin & Gate)
+ * Delivery targets: ONLY the specific assigned Supervisor & Gate (never Admin, never other Supervisors)
  */
 function sendStoreScanNotification({
   eventId,
@@ -394,6 +404,8 @@ function sendStoreScanNotification({
   title,
   message,
   isEmergencyAlarm = true,
+  targetUserIds = [],
+  assignedSupervisor = null,
 }) {
   if (!io) return;
 
@@ -405,6 +417,7 @@ function sendStoreScanNotification({
     materialDetails: materialDetails || 'Material Lot',
     scannerName: scannerName || 'Store Person',
     scannerId: scannerId || null,
+    assignedSupervisor: assignedSupervisor || null,
     scanTime: scanTime || new Date().toISOString(),
     billId,
     source: 'Store',
@@ -416,15 +429,13 @@ function sendStoreScanNotification({
     timestamp: new Date().toISOString(),
   };
 
-  console.log(`[Socket] 📢 Emitting Stage 2 Store Scan Alarm ${eventId} for Bill ${billNumber} to All Panels`);
-
-  // Send to Supervisor room, Admin room, Gate room, and broadcast globally to ensure delivery
-  io.to('supervisor-notifications')
-    .to('admin-notifications')
-    .to('gate-notifications')
-    .emit('new_notification', payload);
-
-  io.emit('new_notification', payload);
+  if (Array.isArray(targetUserIds) && targetUserIds.length > 0) {
+    console.log(`[Socket] 📢 Emitting Stage 2 Store Scan Alarm ${eventId} for Bill ${billNumber} ONLY to user IDs: [${targetUserIds.join(', ')}]`);
+    emitToUsers(targetUserIds, 'new_notification', payload);
+  } else {
+    console.log(`[Socket] 📢 Emitting Stage 2 Store Scan Alarm ${eventId} for Bill ${billNumber} to Gate room`);
+    io.to('gate-notifications').emit('new_notification', payload);
+  }
 
   // Also broadcast status change to gate so gate person knows parcel is now in store
   io.to('gate-notifications').emit('bill:stage_update', {
@@ -438,8 +449,9 @@ function sendStoreScanNotification({
 }
 
 /**
- * Stage 3: Send Supervisor Scan Notification
+ * Stage 3: Send Supervisor Scan Notification (LAST STAGE)
  * Sent when Supervisor verifies/picks up material.
+ * Admin receives a clean message here (isEmergencyAlarm: false).
  */
 function sendSupervisorScanNotification({
   eventId,
@@ -452,6 +464,8 @@ function sendSupervisorScanNotification({
   title,
   message,
   isEmergencyAlarm = true,
+  targetUserIds = [],
+  adminUserIds = [],
 }) {
   if (!io) return;
 
@@ -474,14 +488,20 @@ function sendSupervisorScanNotification({
     timestamp: new Date().toISOString(),
   };
 
-  console.log(`[Socket] 📢 Emitting Stage 3 Supervisor Scan Alarm ${eventId} for Bill ${billNumber} to All Panels`);
+  // Notify Gate/Store users if targeted
+  if (Array.isArray(targetUserIds) && targetUserIds.length > 0) {
+    console.log(`[Socket] 📢 Emitting Stage 3 Supervisor Scan to Gate/Store user IDs: [${targetUserIds.join(', ')}]`);
+    emitToUsers(targetUserIds, 'new_notification', payload);
+  }
 
-  io.to('gate-notifications')
-    .to('store-notifications')
-    .to('admin-notifications')
-    .emit('new_notification', payload);
-
-  io.emit('new_notification', payload);
+  // Admin ONLY receives a clean non-alarm message in this last stage
+  if (Array.isArray(adminUserIds) && adminUserIds.length > 0) {
+    console.log(`[Socket] 📩 Sending Last-Stage Supervisor Receipt Message to Admin IDs: [${adminUserIds.join(', ')}] (No Alarm)`);
+    emitToUsers(adminUserIds, 'new_notification', {
+      ...payload,
+      isEmergencyAlarm: false,
+    });
+  }
 
   io.emit('bill:stage_update', {
     billNumber,
@@ -495,7 +515,6 @@ function sendSupervisorScanNotification({
 
 /**
  * Stage 4 / Generic: Send Scan Notification for Any Material Scan
- * Ensures EVERY scan triggers the real-time emergency alarm across all panels.
  */
 function sendGenericScanNotification({
   eventId,
@@ -507,6 +526,7 @@ function sendGenericScanNotification({
   message,
   source = 'Scanner',
   isEmergencyAlarm = true,
+  targetUserIds = [],
 }) {
   if (!io) return;
 
@@ -526,9 +546,10 @@ function sendGenericScanNotification({
     timestamp: new Date().toISOString(),
   };
 
-  console.log(`[Socket] 📢 Emitting Generic Scan Alarm ${eventId} for ${billNumber} to All Panels`);
-
-  io.emit('new_notification', payload);
+  if (Array.isArray(targetUserIds) && targetUserIds.length > 0) {
+    console.log(`[Socket] 📢 Emitting Generic Scan ${eventId} for ${billNumber} to user IDs: [${targetUserIds.join(', ')}]`);
+    emitToUsers(targetUserIds, 'new_notification', payload);
+  }
 
   return payload;
 }
@@ -547,6 +568,7 @@ function getIO() {
 
 module.exports = {
   initSocket,
+  emitToUsers,
   sendGateScanNotification,
   sendStoreScanNotification,
   sendSupervisorScanNotification,

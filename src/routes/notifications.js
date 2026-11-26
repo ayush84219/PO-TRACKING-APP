@@ -14,6 +14,8 @@ const { logAudit } = require('../services/auditLogger');
 const { notifyStatusChange, sendGateScanNotification, getIO } = require('../services/socketService');
 const S = require('../validators/schemas');
 const { isFirebaseReady } = require('../services/fcmPush');
+const { resolveSupervisorUsers } = require('../services/userDirectory');
+const { binarySearchService } = require('../services/binarySearchService');
 
 /**
  * Public health & FCM readiness diagnostic endpoint
@@ -131,17 +133,13 @@ router.post('/notify-supervisor', wrap(async (req, res) => {
 
   console.log(`[Notification] 📢 Dispatching Supervisor Notification for ${cleanLot} from ${me.name} (${me.role})`);
 
-  // 1. Find all active supervisors & admins
-  const [sups] = await pool.query(
-    "SELECT id, name, email, role FROM user_app WHERE (role = 'supervisor' OR base_role = 'supervisor') AND is_active = 1"
-  );
-  const [admins] = await pool.query(
-    "SELECT id, name, email, role FROM user_app WHERE (role = 'admin' OR base_role = 'admin') AND is_active = 1"
-  );
-
-  const targetMap = new Map();
-  [...sups, ...admins].forEach(u => targetMap.set(u.id, u));
-  const targets = Array.from(targetMap.values());
+  // 1. Resolve ONLY the specific supervisor assigned to this lot via user_details_app (never Admin, never other supervisors)
+  let resolvedSupName = (supervisorName || '').trim() || null;
+  if (!resolvedSupName && binarySearchService.isWarmedUp) {
+    const fastDoc = binarySearchService.lookupFast(cleanLot);
+    if (fastDoc && fastDoc.supervisor) resolvedSupName = String(fastDoc.supervisor).trim();
+  }
+  const targets = await resolveSupervisorUsers(resolvedSupName, null, { fallbackAllIfUnassigned: !resolvedSupName });
 
   const notifTitle = `🚨 URGENT: Material at Gate (${cleanLot})`;
   const notifMessage = `NEW MATERIAL ARRIVED AT GATE: Bill ${cleanLot}. Please verify and collect.`;
@@ -175,7 +173,8 @@ router.post('/notify-supervisor', wrap(async (req, res) => {
     [eventId, cleanLot, cleanLot.replace(/^(PO-|RGP-)/, '')]
   ).catch(() => {});
 
-  // 4. Trigger Real-time Socket.IO notification to all Supervisor, Store, and Admin panels!
+  // 4. Trigger Real-time Socket.IO notification ONLY to the targeted supervisor user IDs
+  const targetUserIds = targets.map(t => t.id);
   const notifPayload = {
     eventId,
     eventType: 'MATERIAL_RECEIVED_AT_GATE',
@@ -192,20 +191,19 @@ router.post('/notify-supervisor', wrap(async (req, res) => {
     timestamp: new Date().toISOString(),
     isReminder: true,
     isEmergencyAlarm: true,
+    targetUserIds,
+    assignedSupervisor: resolvedSupName,
   };
 
-  sendGateScanNotification(notifPayload);
-
-  // 5. Send FCM Push Notification
-  const pushIds = targets.map(t => t.id);
-  if (pushIds.length) {
-    sendPush(pushIds, notifTitle, notifMessage, notifPayload);
+  if (targetUserIds.length > 0) {
+    sendGateScanNotification(notifPayload);
+    sendPush(targetUserIds, notifTitle, notifMessage, notifPayload);
   }
 
   res.json({
     ok: true,
     eventId,
-    message: `Supervisor alert dispatched to ${targets.length} recipients`,
+    message: `Supervisor alert dispatched to ${targets.length} targeted recipient(s)`,
     recipientsCount: targets.length,
   });
 }));
