@@ -279,28 +279,51 @@ async function lookupRgp(upperLot, digitsOnly) {
   };
 }
 
+function parseColorBreakdown(colorBreakdown, defaultStyle = 'Material') {
+  if (!colorBreakdown || typeof colorBreakdown !== 'string') return [];
+  const items = [];
+  const parts = colorBreakdown.split(';').map(p => p.trim()).filter(Boolean);
+  for (const part of parts) {
+    const m = part.match(/^([^:]+):\s*(\d+)\s*(?:pcs)?\s*(?:\((.*?)\))?/i);
+    if (m) {
+      const color = m[1].trim();
+      const qty = parseInt(m[2], 10);
+      const detail = m[3] ? ` (${m[3].trim()})` : '';
+      items.push({
+        name: `${defaultStyle} - ${color}${detail}`,
+        qty,
+        unit: 'PCS',
+        department: 'Trim / Stitching',
+      });
+    }
+  }
+  return items;
+}
+
 // Helper: Look up Zip orders from live zip and historical old_zip tables
-async function lookupZip(upperLot, digitsOnly) {
+async function lookupZip(upperLot, digitsOnly, fastMatch = null) {
   const cleanNum = upperLot.replace(/^ZIP[-/]?/i, '');
-  let zipRow = null;
-  let isOld = false;
+  let zipRow = fastMatch ? fastMatch.data : null;
+  let isOld = Boolean(fastMatch ? fastMatch.isOldPo : false);
 
   // 1. Check live zip table
-  try {
-    const [z1] = await pool.query(
-      `SELECT * FROM zip 
-       WHERE po_number IN (?, ?, ?)
-          OR Lot_Number IN (?, ?, ?)
-          OR id = ?
-          ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
-       LIMIT 1`,
-      digitsOnly && digitsOnly.length >= 3
-        ? [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
-        : [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
-    );
-    if (z1 && z1.length) zipRow = z1[0];
-  } catch (err) {
-    console.warn('[Zip Lookup] zip error:', err.message);
+  if (!zipRow) {
+    try {
+      const [z1] = await pool.query(
+        `SELECT * FROM zip 
+         WHERE po_number IN (?, ?, ?)
+            OR Lot_Number IN (?, ?, ?)
+            OR id = ?
+            ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+         LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 3
+          ? [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
+          : [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
+      );
+      if (z1 && z1.length) zipRow = z1[0];
+    } catch (err) {
+      console.warn('[Zip Lookup] zip error:', err.message);
+    }
   }
 
   // 2. Check old_zip table
@@ -381,25 +404,29 @@ async function lookupZip(upperLot, digitsOnly) {
     statusDisplay = 'At Gate (Pending Pickup)';
   }
 
+  const styleLabel = zipRow.Style || zipRow.Garment_Type || 'Material';
+  const breakdownItems = parseColorBreakdown(zipRow.Color_Breakdown, `Side Pocket Zip`);
+  const totalPieces = Number(zipRow.Total_Pieces) || (breakdownItems.reduce((acc, it) => acc + it.qty, 0)) || 1;
   const materialName = zipRow.Style
-    ? `Zip - ${zipRow.Style} (${zipRow.Garment_Type || 'Garment'})`
-    : `Zip Lot ${lotNumber}`;
+    ? `Zip - ${zipRow.Style} (${totalPieces} PCS)`
+    : `Zip Lot ${lotNumber} (${totalPieces} PCS)`;
 
   return {
     exists: true,
     docType: 'PO',
     subType: 'ZIP',
+    isZip: true,
     poNumber,
     lotNumber,
     materialName,
     vendor: zipRow.Supplier_Name || 'Zip Supplier',
     supplierName: zipRow.Supplier_Name || 'Zip Supplier',
-    supervisor: zipRow.Supervisor || 'Sanjay',
+    supervisor: zipRow.Supervisor || 'Rashmi',
     status: statusDisplay,
-    expectedQuantity: Number(zipRow.Total_Pieces) || 1,
+    expectedQuantity: totalPieces,
     expectedUnit: 'PCS',
     currentStage,
-    date: zipRow.Issue_Date || zipRow.Timestamp || zipRow.Saved_At || null,
+    date: zipRow.Issue_Date || zipRow.Timestamp || zipRow.Saved_At || zipRow.PDF_Generated_Date || null,
     isFullyReceived: currentStage === 'CLOSED',
     isPartialReceived: false,
     scanHistory: scans,
@@ -407,9 +434,9 @@ async function lookupZip(upperLot, digitsOnly) {
     supervisorScan: supervisorScan || null,
     isOldPo: isOld,
     isOldZip: isOld,
-    items: [{
-      name: materialName,
-      qty: Number(zipRow.Total_Pieces) || 1,
+    items: breakdownItems.length > 0 ? breakdownItems : [{
+      name: `Zip - ${styleLabel}`,
+      qty: totalPieces,
       unit: 'PCS',
       department: 'Trim / Stitching',
     }],
@@ -417,27 +444,29 @@ async function lookupZip(upperLot, digitsOnly) {
 }
 
 // Helper: Look up Doori orders from live doori and historical old_doori tables
-async function lookupDoori(upperLot, digitsOnly) {
+async function lookupDoori(upperLot, digitsOnly, fastMatch = null) {
   const cleanNum = upperLot.replace(/^(DORI|DOORI)[-/]?/i, '');
-  let dooriRow = null;
-  let isOld = false;
+  let dooriRow = fastMatch ? fastMatch.data : null;
+  let isOld = Boolean(fastMatch ? fastMatch.isOldPo : false);
 
   // 1. Check live doori table
-  try {
-    const [d1] = await pool.query(
-      `SELECT * FROM doori 
-       WHERE po_number IN (?, ?, ?, ?)
-          OR Lot_Number IN (?, ?, ?)
-          OR id = ?
-          ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
-       LIMIT 1`,
-      digitsOnly && digitsOnly.length >= 3
-        ? [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
-        : [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
-    );
-    if (d1 && d1.length) dooriRow = d1[0];
-  } catch (err) {
-    console.warn('[Doori Lookup] doori error:', err.message);
+  if (!dooriRow) {
+    try {
+      const [d1] = await pool.query(
+        `SELECT * FROM doori 
+         WHERE po_number IN (?, ?, ?, ?)
+            OR Lot_Number IN (?, ?, ?)
+            OR id = ?
+            ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+         LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 3
+          ? [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
+          : [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
+      );
+      if (d1 && d1.length) dooriRow = d1[0];
+    } catch (err) {
+      console.warn('[Doori Lookup] doori error:', err.message);
+    }
   }
 
   // 2. Check old_doori table
@@ -518,25 +547,29 @@ async function lookupDoori(upperLot, digitsOnly) {
     statusDisplay = 'At Gate (Pending Pickup)';
   }
 
+  const styleLabel = dooriRow.Style || dooriRow.Garment_Type || 'Material';
+  const breakdownItems = parseColorBreakdown(dooriRow.Color_Breakdown, `Doori ${styleLabel}`);
+  const totalPieces = Number(dooriRow.Total_Pieces) || (breakdownItems.reduce((acc, it) => acc + it.qty, 0)) || 1;
   const materialName = dooriRow.Style
-    ? `Doori - ${dooriRow.Style} (${dooriRow.Garment_Type || 'Garment'})`
-    : `Doori Lot ${lotNumber}`;
+    ? `Doori - ${dooriRow.Style} (${totalPieces} PCS)`
+    : `Doori Lot ${lotNumber} (${totalPieces} PCS)`;
 
   return {
     exists: true,
     docType: 'PO',
     subType: 'DORI',
+    isDoori: true,
     poNumber,
     lotNumber,
     materialName,
     vendor: dooriRow.Supplier_Name || 'Doori Supplier',
     supplierName: dooriRow.Supplier_Name || 'Doori Supplier',
-    supervisor: dooriRow.Supervisor || 'Sonu',
+    supervisor: dooriRow.Supervisor || 'Rashmi',
     status: statusDisplay,
-    expectedQuantity: Number(dooriRow.Total_Pieces) || 1,
+    expectedQuantity: totalPieces,
     expectedUnit: 'PCS',
     currentStage,
-    date: dooriRow.Issue_Date || dooriRow.Timestamp || null,
+    date: dooriRow.Issue_Date || dooriRow.Timestamp || dooriRow.PDF_Generated_Date || null,
     isFullyReceived: currentStage === 'CLOSED',
     isPartialReceived: false,
     scanHistory: scans,
@@ -544,9 +577,9 @@ async function lookupDoori(upperLot, digitsOnly) {
     supervisorScan: supervisorScan || null,
     isOldPo: isOld,
     isOldDoori: isOld,
-    items: [{
-      name: materialName,
-      qty: Number(dooriRow.Total_Pieces) || 1,
+    items: breakdownItems.length > 0 ? breakdownItems : [{
+      name: `Doori - ${styleLabel}`,
+      qty: totalPieces,
       unit: 'PCS',
       department: 'Trim / Stitching',
     }],
@@ -587,32 +620,39 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   let pos = [];
   let oldPos = [];
 
-  // Fast-Path: In-memory binary search lookup (O(log N) - < 0.1ms)
+  // Fast-Path: In-memory binary search lookup (O(log N) & O(1) direct map - < 0.1ms)
   if (binarySearchService.isWarmedUp) {
-    if (isExplicitRgp) {
-      const rgpResult = await lookupRgp(upperLot, digitsOnly);
-      if (rgpResult) return res.json(rgpResult);
-    } else {
-      // Check PO index first
-      const fastPo = binarySearchService.lookupPo(upperLot);
-      if (fastPo && fastPo.data) {
-        if (fastPo.isOldPo) {
-          oldPos = [fastPo.data];
+    const hint = isExplicitZip ? 'zip' : (isExplicitDoori ? 'doori' : (isExplicitRgp ? 'rgp' : (req.query.subType || req.query.type || null)));
+    const fastMatch = binarySearchService.lookupFast(upperLot, hint);
+    if (fastMatch) {
+      if (fastMatch.subType === 'ZIP') {
+        const zipResult = await lookupZip(fastMatch.poNumber || upperLot, digitsOnly, fastMatch);
+        if (zipResult) return res.json(zipResult);
+      } else if (fastMatch.subType === 'DORI') {
+        const dooriResult = await lookupDoori(fastMatch.poNumber || upperLot, digitsOnly, fastMatch);
+        if (dooriResult) return res.json(dooriResult);
+      } else if (fastMatch.docType === 'RGP') {
+        const rgpResult = await lookupRgp(fastMatch.rgpNumber || upperLot, digitsOnly);
+        if (rgpResult) return res.json(rgpResult);
+      } else if (fastMatch.data) {
+        if (fastMatch.isOldPo) {
+          oldPos = [fastMatch.data];
         } else {
-          pos = [fastPo.data];
-        }
-      } else {
-        // If not in POs, check if in RGPs via Binary Search
-        const fastRgp = binarySearchService.lookupRgp(upperLot);
-        if (fastRgp) {
-          const rgpResult = await lookupRgp(fastRgp.rgpNumber || upperLot, digitsOnly);
-          if (rgpResult) return res.json(rgpResult);
+          pos = [fastMatch.data];
         }
       }
     }
   } else if (isExplicitRgp) {
     const rgpResult = await lookupRgp(upperLot, digitsOnly);
     if (rgpResult) return res.json(rgpResult);
+  }
+
+  // Pre-check for numeric lots (e.g. 65031): check Zip & Doori before checking old_purchase_orders
+  if (!pos.length && !oldPos.length && digitsOnly && !isExplicitPo) {
+    const earlyZip = await lookupZip(upperLot, digitsOnly);
+    if (earlyZip) return res.json(earlyZip);
+    const earlyDoori = await lookupDoori(upperLot, digitsOnly);
+    if (earlyDoori) return res.json(earlyDoori);
   }
 
   // =========================================================================

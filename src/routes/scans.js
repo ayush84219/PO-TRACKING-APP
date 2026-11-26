@@ -1044,6 +1044,34 @@ router.get('/tracking-summary', wrap(async (req, res) => {
         received_date: z.Material_Received_Date,
       });
     }
+    const [ozRows] = await pool.query(
+      `SELECT id, CONCAT('ZIP-', Lot_Number) AS po_number,
+              Supplier_Name AS vendor_name, Style AS design_name,
+              'ZIP' AS design_category, Total_Pieces AS total_quantity,
+              Issue_Date AS date, Supervisor AS supervisor_name,
+              Lot_Number, Gate_Entry_Person, Gate_Entry_Date,
+              Material_Received_By, Material_Received_Date
+       FROM old_zip ORDER BY id DESC LIMIT 30`
+    );
+    for (const z of ozRows) {
+      pos.push({
+        id: `OLD-ZIP-${z.id}`,
+        po_number: z.po_number,
+        vendor_name: z.vendor_name || 'Zip Supplier',
+        design_name: z.design_name || `Zip Lot ${z.Lot_Number}`,
+        design_category: 'ZIP',
+        items: JSON.stringify([{ name: z.design_name || 'Zip', qty: z.total_quantity || 1, unit: 'PCS' }]),
+        status: z.Material_Received_Date ? 'Received' : (z.Gate_Entry_Date ? 'At Gate' : 'Open'),
+        date: z.date,
+        supervisor_name: z.supervisor_name || 'Rashmi',
+        subType: 'ZIP',
+        lot_number: z.Lot_Number,
+        gate_person: z.Gate_Entry_Person,
+        gate_date: z.Gate_Entry_Date,
+        received_by: z.Material_Received_By,
+        received_date: z.Material_Received_Date,
+      });
+    }
   } catch (err) {
     console.error('Error fetching zip in tracking-summary:', err.message);
   }
@@ -1070,6 +1098,35 @@ router.get('/tracking-summary', wrap(async (req, res) => {
         status: d.status || (d.Material_Received_Date ? 'Received' : (d.Gate_Entry_Date ? 'At Gate' : 'Pending')),
         date: d.date,
         supervisor_name: d.supervisor_name || 'Supervisor',
+        subType: 'DORI',
+        lot_number: d.Lot_Number,
+        gate_person: d.Gate_Entry_Person,
+        gate_date: d.Gate_Entry_Date,
+        received_by: d.Material_Received_By,
+        received_date: d.Material_Received_Date,
+      });
+    }
+
+    const [odRows] = await pool.query(
+      `SELECT id, CONCAT('DORI-', Lot_Number) AS po_number,
+              Supplier_Name AS vendor_name, Style AS design_name,
+              'DORI' AS design_category, Total_Pieces AS total_quantity,
+              Issue_Date AS date, Supervisor AS supervisor_name,
+              Lot_Number, Gate_Entry_Person, Gate_Entry_Date,
+              Material_Received_By, Material_Received_Date
+       FROM old_doori ORDER BY id DESC LIMIT 30`
+    );
+    for (const d of odRows) {
+      pos.push({
+        id: `OLD-DORI-${d.id}`,
+        po_number: d.po_number,
+        vendor_name: d.vendor_name || 'Doori Supplier',
+        design_name: d.design_name || `Doori Lot ${d.Lot_Number}`,
+        design_category: 'DORI',
+        items: JSON.stringify([{ name: d.design_name || 'Doori', qty: d.total_quantity || 1, unit: 'PCS' }]),
+        status: d.Material_Received_Date ? 'Received' : (d.Gate_Entry_Date ? 'At Gate' : 'Open'),
+        date: d.date,
+        supervisor_name: d.supervisor_name || 'Rashmi',
         subType: 'DORI',
         lot_number: d.Lot_Number,
         gate_person: d.Gate_Entry_Person,
