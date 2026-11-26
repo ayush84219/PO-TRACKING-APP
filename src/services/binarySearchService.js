@@ -143,7 +143,7 @@ class BinarySearchService {
       const now = Date.now();
       const needOldRefresh = forceOld || !this.cachedOldPos || !this.cachedOldRgps || (now - this.lastOldDataRefresh > 12 * 3600 * 1000);
 
-      // Fetch live POs & RGPs every cycle; fetch historical archives only once on boot or every 12h
+      // Fetch live POs, RGPs, Zip & Doori every cycle; fetch historical archives only once on boot or every 12h
       const queries = [
         pool.query(`
           SELECT id, poNumber, vendorName, designName, designCategory, items, status, date,
@@ -155,6 +155,20 @@ class BinarySearchService {
           SELECT id, rgpNo, vendor, rgpType, department, purpose, entries, status, date,
                  expectedReturnDate, vehicleNo, preparedBy, authorizedBy
           FROM rgp
+        `).then(res => res[0]).catch(() => []),
+
+        pool.query(`
+          SELECT id, po_number, Lot_Number, Garment_Type, Style, Total_Pieces, Supervisor,
+                 Gate_Entry_Person, Gate_Entry_Date, Material_Received_By, Material_Received_Date,
+                 Supplier_Name, status, Issue_Date
+          FROM zip
+        `).then(res => res[0]).catch(() => []),
+
+        pool.query(`
+          SELECT id, po_number, Lot_Number, Garment_Type, Style, Total_Pieces, Supervisor,
+                 Gate_Entry_Person, Gate_Entry_Date, Material_Received_By, Material_Received_Date,
+                 Supplier_Name, status, Issue_Date
+          FROM doori
         `).then(res => res[0]).catch(() => []),
       ];
 
@@ -171,6 +185,16 @@ class BinarySearchService {
                    quantity_sent, uom, expected_return_date, vehicle_no, authorized_by,
                    prepared_by, status, items_json
             FROM old_rgp
+          `).then(res => res[0]).catch(() => []),
+
+          pool.query(`
+            SELECT id, Lot_Number, record_key
+            FROM old_zip
+          `).then(res => res[0]).catch(() => []),
+
+          pool.query(`
+            SELECT id, Lot_Number, record_key
+            FROM old_doori
           `).then(res => res[0]).catch(() => [])
         );
       }
@@ -178,15 +202,21 @@ class BinarySearchService {
       const results = await Promise.all(queries);
       const pLive = results[0];
       const rLive = results[1];
+      const zipLive = results[2] || [];
+      const dooriLive = results[3] || [];
 
       if (needOldRefresh) {
-        this.cachedOldPos = results[2] || [];
-        this.cachedOldRgps = results[3] || [];
+        this.cachedOldPos = results[4] || [];
+        this.cachedOldRgps = results[5] || [];
+        this.cachedOldZip = results[6] || [];
+        this.cachedOldDoori = results[7] || [];
         this.lastOldDataRefresh = now;
       }
 
       const pOld = this.cachedOldPos || [];
       const rOld = this.cachedOldRgps || [];
+      const zipOld = this.cachedOldZip || [];
+      const dooriOld = this.cachedOldDoori || [];
 
       // --- Build PO Indexes ---
       const newPosByExact = new Map();
@@ -245,6 +275,126 @@ class BinarySearchService {
         newPosByPrefix.push(entry);
         if (suffix4) newPosBySuffix.push(entry);
         if (entry.vendor) newPosByVendor.push(entry);
+      }
+
+      // --- Index Live & Old Zip POs ---
+      for (const z of zipLive) {
+        const poNum = (z.po_number || `ZIP-${z.Lot_Number}`).toUpperCase().trim();
+        const lotNum = String(z.Lot_Number || '').toUpperCase().trim();
+        if (!poNum || seenPos.has(poNum)) continue;
+        seenPos.add(poNum);
+        const digits = lotNum.replace(/[^0-9]/g, '') || poNum.replace(/[^0-9]/g, '');
+        const suffix4 = digits.slice(-4);
+        const entry = {
+          key: poNum,
+          poNumber: poNum,
+          lotNumber: lotNum,
+          digits,
+          suffix4,
+          vendor: z.Supplier_Name || 'Zip Supplier',
+          designName: z.Style || `Zip - ${z.Garment_Type || 'Garment'}`,
+          supervisor: z.Supervisor || '',
+          status: z.status || (z.Material_Received_Date ? 'Received' : (z.Gate_Entry_Date ? 'At Gate' : 'Live')),
+          source: 'zip',
+          subType: 'ZIP',
+          data: z,
+          isOldPo: false,
+        };
+        newPosByExact.set(poNum, entry);
+        if (lotNum) newPosByExact.set(lotNum, entry);
+        if (digits) newPosByExact.set(digits, entry);
+        newPosByPrefix.push(entry);
+        if (suffix4) newPosBySuffix.push(entry);
+        if (entry.vendor) newPosByVendor.push(entry);
+      }
+
+      for (const z of zipOld) {
+        const lotNum = String(z.Lot_Number || '').toUpperCase().trim();
+        const poNum = `ZIP-${lotNum}`;
+        if (!lotNum || seenPos.has(poNum)) continue;
+        seenPos.add(poNum);
+        const digits = lotNum.replace(/[^0-9]/g, '');
+        const suffix4 = digits.slice(-4);
+        const entry = {
+          key: poNum,
+          poNumber: poNum,
+          lotNumber: lotNum,
+          digits,
+          suffix4,
+          vendor: 'Historical Zip Supplier',
+          designName: `Old Zip Lot ${lotNum}`,
+          supervisor: '',
+          status: 'Archived / Old Zip',
+          source: 'old_zip',
+          subType: 'ZIP',
+          data: z,
+          isOldPo: true,
+        };
+        newPosByExact.set(poNum, entry);
+        newPosByExact.set(lotNum, entry);
+        if (digits) newPosByExact.set(digits, entry);
+        newPosByPrefix.push(entry);
+        if (suffix4) newPosBySuffix.push(entry);
+      }
+
+      // --- Index Live & Old Doori POs ---
+      for (const d of dooriLive) {
+        const poNum = (d.po_number || `DORI-${d.Lot_Number}`).toUpperCase().trim();
+        const lotNum = String(d.Lot_Number || '').toUpperCase().trim();
+        if (!poNum || seenPos.has(poNum)) continue;
+        seenPos.add(poNum);
+        const digits = lotNum.replace(/[^0-9]/g, '') || poNum.replace(/[^0-9]/g, '');
+        const suffix4 = digits.slice(-4);
+        const entry = {
+          key: poNum,
+          poNumber: poNum,
+          lotNumber: lotNum,
+          digits,
+          suffix4,
+          vendor: d.Supplier_Name || 'Doori Supplier',
+          designName: d.Style || `Doori - ${d.Garment_Type || 'Garment'}`,
+          supervisor: d.Supervisor || '',
+          status: d.status || (d.Material_Received_Date ? 'Received' : (d.Gate_Entry_Date ? 'At Gate' : 'Live')),
+          source: 'doori',
+          subType: 'DORI',
+          data: d,
+          isOldPo: false,
+        };
+        newPosByExact.set(poNum, entry);
+        if (lotNum) newPosByExact.set(lotNum, entry);
+        if (digits) newPosByExact.set(digits, entry);
+        newPosByPrefix.push(entry);
+        if (suffix4) newPosBySuffix.push(entry);
+        if (entry.vendor) newPosByVendor.push(entry);
+      }
+
+      for (const d of dooriOld) {
+        const lotNum = String(d.Lot_Number || '').toUpperCase().trim();
+        const poNum = `DORI-${lotNum}`;
+        if (!lotNum || seenPos.has(poNum)) continue;
+        seenPos.add(poNum);
+        const digits = lotNum.replace(/[^0-9]/g, '');
+        const suffix4 = digits.slice(-4);
+        const entry = {
+          key: poNum,
+          poNumber: poNum,
+          lotNumber: lotNum,
+          digits,
+          suffix4,
+          vendor: 'Historical Doori Supplier',
+          designName: `Old Doori Lot ${lotNum}`,
+          supervisor: '',
+          status: 'Archived / Old Doori',
+          source: 'old_doori',
+          subType: 'DORI',
+          data: d,
+          isOldPo: true,
+        };
+        newPosByExact.set(poNum, entry);
+        newPosByExact.set(lotNum, entry);
+        if (digits) newPosByExact.set(digits, entry);
+        newPosByPrefix.push(entry);
+        if (suffix4) newPosBySuffix.push(entry);
       }
 
       // Sort for Binary Search

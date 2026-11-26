@@ -64,14 +64,22 @@ router.post('/', wrap(async (req, res) => {
 
   const upperLot = rawLot.toUpperCase();
   const isRgp = upperLot.startsWith('RGP-') || upperLot.startsWith('RGP') || parsed.docType === 'RGP';
-  const isPoPattern = upperLot.startsWith('PO-') || /^\d{4,6}$/.test(rawLot) || parsed.docType === 'PO';
+  const isZip = upperLot.startsWith('ZIP') || upperLot.includes('ZIP') || parsed.subType === 'ZIP' || parsed.docType === 'ZIP';
+  const isDoori = upperLot.startsWith('DORI') || upperLot.startsWith('DOORI') || upperLot.includes('DORI') || upperLot.includes('DOORI') || parsed.subType === 'DORI' || parsed.docType === 'DORI';
+  const isPoPattern = upperLot.startsWith('PO-') || /^\d{4,6}$/.test(rawLot) || parsed.docType === 'PO' || isZip || isDoori;
 
-  // Preserve exact lot string for generic lots, normalize POs and RGPs
+  // Preserve exact lot string for generic lots, normalize POs, Zip, Doori, and RGPs
   let docLot = rawLot;
   if (isRgp) {
     docLot = (upperLot.startsWith('RGP-') || upperLot.startsWith('RGP/'))
       ? upperLot
       : (upperLot.startsWith('RGP') ? upperLot : `RGP-${upperLot}`);
+  } else if (isZip) {
+    const cleanZip = upperLot.replace(/^ZIP[-/]?/i, '');
+    docLot = upperLot.startsWith('ZIP-') ? upperLot : `ZIP-${cleanZip}`;
+  } else if (isDoori) {
+    const cleanDoori = upperLot.replace(/^(DOORI|DORI)[-/]?/i, '');
+    docLot = (upperLot.startsWith('DORI-') || upperLot.startsWith('DOORI-')) ? upperLot : `DORI-${cleanDoori}`;
   } else if (upperLot.startsWith('PO-')) {
     docLot = upperLot;
   } else if (/^\d{4,6}$/.test(rawLot)) {
@@ -426,7 +434,7 @@ router.post('/', wrap(async (req, res) => {
     }
 
     // Sync PO status in purchase_orders & purchase_orders_app
-    if (!isRgp && isPoPattern) {
+    if (!isRgp && isPoPattern && !isZip && !isDoori) {
       const cleanPo = docLot.startsWith('PO-') ? docLot : `PO-${docLot}`;
       const rawPo = cleanPo.replace(/^PO-/, '');
       let poStatus = 'At Gate';
@@ -443,6 +451,42 @@ router.post('/', wrap(async (req, res) => {
         [poStatus, cleanPo, rawPo]
       ).catch(() => {});
       // Preserving Project 1 purchase_orders table untouched
+    }
+
+    // Sync Zip table status
+    if (isZip) {
+      const cleanZipNum = upperLot.replace(/^ZIP[-/]?/i, '');
+      if (isGateScan) {
+        await conn.query(
+          `UPDATE zip SET Gate_Entry_Person = ?, Gate_Entry_Date = NOW(), status = 'At Gate'
+           WHERE po_number IN (?, ?) OR Lot_Number IN (?, ?)`,
+          [me.name || 'Gate Security', docLot, `ZIP-${cleanZipNum}`, cleanZipNum, docLot]
+        ).catch(() => {});
+      } else if (isSupervisorScan) {
+        await conn.query(
+          `UPDATE zip SET Material_Received_By = ?, Material_Received_Date = NOW(), status = 'Received'
+           WHERE po_number IN (?, ?) OR Lot_Number IN (?, ?)`,
+          [me.name || 'Supervisor', docLot, `ZIP-${cleanZipNum}`, cleanZipNum, docLot]
+        ).catch(() => {});
+      }
+    }
+
+    // Sync Doori table status
+    if (isDoori) {
+      const cleanDooriNum = upperLot.replace(/^(DOORI|DORI)[-/]?/i, '');
+      if (isGateScan) {
+        await conn.query(
+          `UPDATE doori SET Gate_Entry_Person = ?, Gate_Entry_Date = NOW(), status = 'At Gate'
+           WHERE po_number IN (?, ?, ?) OR Lot_Number IN (?, ?)`,
+          [me.name || 'Gate Security', docLot, `DORI-${cleanDooriNum}`, `DOORI-${cleanDooriNum}`, cleanDooriNum, docLot]
+        ).catch(() => {});
+      } else if (isSupervisorScan) {
+        await conn.query(
+          `UPDATE doori SET Material_Received_By = ?, Material_Received_Date = NOW(), status = 'Received'
+           WHERE po_number IN (?, ?, ?) OR Lot_Number IN (?, ?)`,
+          [me.name || 'Supervisor', docLot, `DORI-${cleanDooriNum}`, `DOORI-${cleanDooriNum}`, cleanDooriNum, docLot]
+        ).catch(() => {});
+      }
     }
 
     // Sync RGP status in rgp table
@@ -970,6 +1014,74 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     console.error('Error fetching old_rgp in tracking-summary:', err.message);
   }
 
+  // Fetch recent Zip orders (Live & Old)
+  try {
+    const [zRows] = await pool.query(
+      `SELECT id, COALESCE(po_number, CONCAT('ZIP-', Lot_Number)) AS po_number,
+              Supplier_Name AS vendor_name, Style AS design_name,
+              'ZIP' AS design_category, Total_Pieces AS total_quantity,
+              Issue_Date AS date, Supervisor AS supervisor_name,
+              status, Lot_Number, Gate_Entry_Person, Gate_Entry_Date,
+              Material_Received_By, Material_Received_Date
+       FROM zip ORDER BY id DESC LIMIT 50`
+    );
+    for (const z of zRows) {
+      pos.push({
+        id: `ZIP-${z.id}`,
+        po_number: z.po_number,
+        vendor_name: z.vendor_name || 'Zip Supplier',
+        design_name: z.design_name || `Zip Lot ${z.Lot_Number}`,
+        design_category: 'ZIP',
+        items: JSON.stringify([{ name: z.design_name || 'Zip', qty: z.total_quantity || 1, unit: 'PCS' }]),
+        status: z.status || (z.Material_Received_Date ? 'Received' : (z.Gate_Entry_Date ? 'At Gate' : 'Pending')),
+        date: z.date,
+        supervisor_name: z.supervisor_name || 'Supervisor',
+        subType: 'ZIP',
+        lot_number: z.Lot_Number,
+        gate_person: z.Gate_Entry_Person,
+        gate_date: z.Gate_Entry_Date,
+        received_by: z.Material_Received_By,
+        received_date: z.Material_Received_Date,
+      });
+    }
+  } catch (err) {
+    console.error('Error fetching zip in tracking-summary:', err.message);
+  }
+
+  // Fetch recent Doori orders (Live & Old)
+  try {
+    const [dRows] = await pool.query(
+      `SELECT id, COALESCE(po_number, CONCAT('DORI-', Lot_Number)) AS po_number,
+              Supplier_Name AS vendor_name, Style AS design_name,
+              'DORI' AS design_category, Total_Pieces AS total_quantity,
+              Issue_Date AS date, Supervisor AS supervisor_name,
+              status, Lot_Number, Gate_Entry_Person, Gate_Entry_Date,
+              Material_Received_By, Material_Received_Date
+       FROM doori ORDER BY id DESC LIMIT 50`
+    );
+    for (const d of dRows) {
+      pos.push({
+        id: `DORI-${d.id}`,
+        po_number: d.po_number,
+        vendor_name: d.vendor_name || 'Doori Supplier',
+        design_name: d.design_name || `Doori Lot ${d.Lot_Number}`,
+        design_category: 'DORI',
+        items: JSON.stringify([{ name: d.design_name || 'Doori', qty: d.total_quantity || 1, unit: 'PCS' }]),
+        status: d.status || (d.Material_Received_Date ? 'Received' : (d.Gate_Entry_Date ? 'At Gate' : 'Pending')),
+        date: d.date,
+        supervisor_name: d.supervisor_name || 'Supervisor',
+        subType: 'DORI',
+        lot_number: d.Lot_Number,
+        gate_person: d.Gate_Entry_Person,
+        gate_date: d.Gate_Entry_Date,
+        received_by: d.Material_Received_By,
+        received_date: d.Material_Received_Date,
+      });
+    }
+  } catch (err) {
+    console.error('Error fetching doori in tracking-summary:', err.message);
+  }
+
   const [allScans] = await pool.query(
     `SELECT s.id, s.lot_number AS lotNumber, s.scan_stage AS scanStage, s.status, s.note,
             s.event_id AS eventId, s.delivery_status AS deliveryStatus,
@@ -1023,7 +1135,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     let progressPercent = 10;
     let currentStep = 0;
 
-    if (hasFinalClosed) {
+    if (hasFinalClosed || po.received_date || po.received_by || po.status === 'Received') {
       currentStage = 'CLOSED';
       statusDisplay = 'Closed';
       progressPercent = 100;
@@ -1033,9 +1145,9 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       statusDisplay = 'In Store (Awaiting Supervisor)';
       progressPercent = 66;
       currentStep = 2;
-    } else if (lastScan && (lastScan.scanStage === 'GATE_INWARD' || (lastScan.note && lastScan.note.includes('[GATE ENTRY]')))) {
+    } else if ((lastScan && (lastScan.scanStage === 'GATE_INWARD' || (lastScan.note && lastScan.note.includes('[GATE ENTRY]')))) || po.gate_date || po.gate_person || po.status === 'At Gate') {
       currentStage = 'AT_GATE';
-      statusDisplay = lastScan.status === 'pending' ? 'At Gate (Half/Partial)' : 'At Gate (Complete)';
+      statusDisplay = (lastScan && lastScan.status === 'pending') ? 'At Gate (Half/Partial)' : 'At Gate (Complete)';
       progressPercent = 33;
       currentStep = 1;
     } else if (lastScan && lastScan.scanStage === 'SUPERVISOR_PICKUP') {
@@ -1079,6 +1191,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       totalQuantity: totalQty || 1,
       unit,
       itemsCount,
+      subType: po.subType || 'PO',
       gateInwardScan: gateInwardScan
         ? {
             officer: gateInwardScan.scannedByName,
@@ -1091,7 +1204,12 @@ router.get('/tracking-summary', wrap(async (req, res) => {
             acknowledgedAt: gateInwardScan.acknowledgedAt,
             acknowledgedByName: gateInwardScan.acknowledgedByName,
           }
-        : null,
+        : (po.gate_person || po.gate_date ? {
+            officer: po.gate_person || 'Gate Security',
+            time: po.gate_date || po.date,
+            note: 'Gate entry recorded in system',
+            status: 'completed',
+          } : null),
       storeScan: storeScan
         ? {
             officer: storeScan.scannedByName,
@@ -1113,7 +1231,12 @@ router.get('/tracking-summary', wrap(async (req, res) => {
             acknowledgedAt: supervisorScan.acknowledgedAt,
             acknowledgedByName: supervisorScan.acknowledgedByName,
           }
-        : null,
+        : (po.received_by || po.received_date ? {
+            officer: po.received_by || po.supervisor_name || 'Supervisor',
+            time: po.received_date,
+            note: 'Material received and verified in warehouse',
+            status: 'completed',
+          } : null),
       historyCount: lotScans.length,
     };
   });

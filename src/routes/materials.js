@@ -279,6 +279,280 @@ async function lookupRgp(upperLot, digitsOnly) {
   };
 }
 
+// Helper: Look up Zip orders from live zip and historical old_zip tables
+async function lookupZip(upperLot, digitsOnly) {
+  const cleanNum = upperLot.replace(/^ZIP[-/]?/i, '');
+  let zipRow = null;
+  let isOld = false;
+
+  // 1. Check live zip table
+  try {
+    const [z1] = await pool.query(
+      `SELECT * FROM zip 
+       WHERE po_number IN (?, ?, ?)
+          OR Lot_Number IN (?, ?, ?)
+          OR id = ?
+          ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+       LIMIT 1`,
+      digitsOnly && digitsOnly.length >= 3
+        ? [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
+        : [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
+    );
+    if (z1 && z1.length) zipRow = z1[0];
+  } catch (err) {
+    console.warn('[Zip Lookup] zip error:', err.message);
+  }
+
+  // 2. Check old_zip table
+  if (!zipRow) {
+    try {
+      const [zOld] = await pool.query(
+        `SELECT * FROM old_zip 
+         WHERE Lot_Number IN (?, ?, ?)
+            OR record_key LIKE ?
+            OR id = ?
+            ${digitsOnly && digitsOnly.length >= 3 ? 'OR Lot_Number LIKE ?' : ''}
+         ORDER BY id DESC LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 3
+          ? [upperLot, cleanNum, digitsOnly, `%${cleanNum}%`, digitsOnly || -1, `%${digitsOnly}`]
+          : [upperLot, cleanNum, digitsOnly || -1, `%${cleanNum}%`, digitsOnly || -1]
+      );
+      if (zOld && zOld.length) {
+        zipRow = zOld[0];
+        isOld = true;
+      }
+    } catch (err) {
+      console.warn('[Zip Lookup] old_zip error:', err.message);
+    }
+  }
+
+  if (!zipRow) return null;
+
+  const poNumber = zipRow.po_number || `ZIP-${zipRow.Lot_Number}`;
+  const lotNumber = String(zipRow.Lot_Number || poNumber);
+  const cleanDigits = lotNumber.replace(/[^0-9]/g, '');
+
+  // Query scans_app for scan history
+  const [scans] = await pool.query(
+    `SELECT s.id, s.scan_stage, s.status, s.note, s.created_at AS createdAt,
+            s.event_id AS eventId, s.delivery_status AS deliveryStatus,
+            s.delivered_at AS deliveredAt, s.acknowledged_at AS acknowledgedAt,
+            s.acknowledged_by_name AS acknowledgedByName,
+            s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
+     FROM scans_app s
+     LEFT JOIN user_app u ON u.id = s.scanned_by
+     WHERE s.lot_number IN (?, ?, ?, ?)
+     ORDER BY s.id ASC`,
+    [poNumber, lotNumber, cleanDigits, `PO-${cleanDigits}`]
+  );
+
+  let gateScan = scans.find(s => s.scan_stage === 'GATE_INWARD' || s.scan_stage === 'GATE_IN' || (s.note && s.note.includes('[GATE ENTRY]')));
+  let supervisorScan = scans.find(s => s.scan_stage === 'SUPERVISOR_PICKUP' || s.scan_stage === 'SUPERVISOR_INWARD' || (s.note && s.note.includes('[SUPERVISOR PICKUP]')));
+
+  // Synthesize gate scan if present in table
+  if (!gateScan && (zipRow.Gate_Entry_Person || zipRow.Gate_Entry_Date)) {
+    gateScan = {
+      scannedByName: zipRow.Gate_Entry_Person || 'Gate Officer',
+      createdAt: zipRow.Gate_Entry_Date || zipRow.Issue_Date || new Date().toISOString(),
+      status: 'pending',
+      scan_stage: 'GATE_INWARD',
+      note: 'Gate inward recorded in Zip log',
+    };
+  }
+
+  // Synthesize supervisor scan if present in table
+  if (!supervisorScan && (zipRow.Material_Received_By || zipRow.Material_Received_Date)) {
+    supervisorScan = {
+      scannedByName: zipRow.Material_Received_By || zipRow.Supervisor || 'Supervisor',
+      createdAt: zipRow.Material_Received_Date || new Date().toISOString(),
+      status: 'completed',
+      scan_stage: 'SUPERVISOR_PICKUP',
+      note: 'Material received by supervisor in Zip log',
+    };
+  }
+
+  let currentStage = 'GENERATED';
+  let statusDisplay = 'Sent to Vendor';
+  if (supervisorScan || zipRow.status === 'Received' || zipRow.Material_Received_Date) {
+    currentStage = 'CLOSED';
+    statusDisplay = 'Verified in Warehouse';
+  } else if (gateScan || zipRow.Gate_Entry_Date) {
+    currentStage = 'AT_GATE';
+    statusDisplay = 'At Gate (Pending Pickup)';
+  }
+
+  const materialName = zipRow.Style
+    ? `Zip - ${zipRow.Style} (${zipRow.Garment_Type || 'Garment'})`
+    : `Zip Lot ${lotNumber}`;
+
+  return {
+    exists: true,
+    docType: 'PO',
+    subType: 'ZIP',
+    poNumber,
+    lotNumber,
+    materialName,
+    vendor: zipRow.Supplier_Name || 'Zip Supplier',
+    supplierName: zipRow.Supplier_Name || 'Zip Supplier',
+    supervisor: zipRow.Supervisor || 'Sanjay',
+    status: statusDisplay,
+    expectedQuantity: Number(zipRow.Total_Pieces) || 1,
+    expectedUnit: 'PCS',
+    currentStage,
+    date: zipRow.Issue_Date || zipRow.Timestamp || zipRow.Saved_At || null,
+    isFullyReceived: currentStage === 'CLOSED',
+    isPartialReceived: false,
+    scanHistory: scans,
+    gateInwardScan: gateScan || null,
+    supervisorScan: supervisorScan || null,
+    isOldPo: isOld,
+    isOldZip: isOld,
+    items: [{
+      name: materialName,
+      qty: Number(zipRow.Total_Pieces) || 1,
+      unit: 'PCS',
+      department: 'Trim / Stitching',
+    }],
+  };
+}
+
+// Helper: Look up Doori orders from live doori and historical old_doori tables
+async function lookupDoori(upperLot, digitsOnly) {
+  const cleanNum = upperLot.replace(/^(DORI|DOORI)[-/]?/i, '');
+  let dooriRow = null;
+  let isOld = false;
+
+  // 1. Check live doori table
+  try {
+    const [d1] = await pool.query(
+      `SELECT * FROM doori 
+       WHERE po_number IN (?, ?, ?, ?)
+          OR Lot_Number IN (?, ?, ?)
+          OR id = ?
+          ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+       LIMIT 1`,
+      digitsOnly && digitsOnly.length >= 3
+        ? [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
+        : [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
+    );
+    if (d1 && d1.length) dooriRow = d1[0];
+  } catch (err) {
+    console.warn('[Doori Lookup] doori error:', err.message);
+  }
+
+  // 2. Check old_doori table
+  if (!dooriRow) {
+    try {
+      const [dOld] = await pool.query(
+        `SELECT * FROM old_doori 
+         WHERE Lot_Number IN (?, ?, ?)
+            OR record_key LIKE ?
+            OR id = ?
+            ${digitsOnly && digitsOnly.length >= 3 ? 'OR Lot_Number LIKE ?' : ''}
+         ORDER BY id DESC LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 3
+          ? [upperLot, cleanNum, digitsOnly, `%${cleanNum}%`, digitsOnly || -1, `%${digitsOnly}`]
+          : [upperLot, cleanNum, digitsOnly || -1, `%${cleanNum}%`, digitsOnly || -1]
+      );
+      if (dOld && dOld.length) {
+        dooriRow = dOld[0];
+        isOld = true;
+      }
+    } catch (err) {
+      console.warn('[Doori Lookup] old_doori error:', err.message);
+    }
+  }
+
+  if (!dooriRow) return null;
+
+  const poNumber = dooriRow.po_number || `DORI-${dooriRow.Lot_Number}`;
+  const lotNumber = String(dooriRow.Lot_Number || poNumber);
+  const cleanDigits = lotNumber.replace(/[^0-9]/g, '');
+
+  // Query scans_app for scan history
+  const [scans] = await pool.query(
+    `SELECT s.id, s.scan_stage, s.status, s.note, s.created_at AS createdAt,
+            s.event_id AS eventId, s.delivery_status AS deliveryStatus,
+            s.delivered_at AS deliveredAt, s.acknowledged_at AS acknowledgedAt,
+            s.acknowledged_by_name AS acknowledgedByName,
+            s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
+     FROM scans_app s
+     LEFT JOIN user_app u ON u.id = s.scanned_by
+     WHERE s.lot_number IN (?, ?, ?, ?)
+     ORDER BY s.id ASC`,
+    [poNumber, lotNumber, cleanDigits, `PO-${cleanDigits}`]
+  );
+
+  let gateScan = scans.find(s => s.scan_stage === 'GATE_INWARD' || s.scan_stage === 'GATE_IN' || (s.note && s.note.includes('[GATE ENTRY]')));
+  let supervisorScan = scans.find(s => s.scan_stage === 'SUPERVISOR_PICKUP' || s.scan_stage === 'SUPERVISOR_INWARD' || (s.note && s.note.includes('[SUPERVISOR PICKUP]')));
+
+  // Synthesize gate scan if present in table
+  if (!gateScan && (dooriRow.Gate_Entry_Person || dooriRow.Gate_Entry_Date)) {
+    gateScan = {
+      scannedByName: dooriRow.Gate_Entry_Person || 'Gate Officer',
+      createdAt: dooriRow.Gate_Entry_Date || dooriRow.Issue_Date || new Date().toISOString(),
+      status: 'pending',
+      scan_stage: 'GATE_INWARD',
+      note: 'Gate inward recorded in Doori log',
+    };
+  }
+
+  // Synthesize supervisor scan if present in table
+  if (!supervisorScan && (dooriRow.Material_Received_By || dooriRow.Material_Received_Date)) {
+    supervisorScan = {
+      scannedByName: dooriRow.Material_Received_By || dooriRow.Supervisor || 'Supervisor',
+      createdAt: dooriRow.Material_Received_Date || new Date().toISOString(),
+      status: 'completed',
+      scan_stage: 'SUPERVISOR_PICKUP',
+      note: 'Material received by supervisor in Doori log',
+    };
+  }
+
+  let currentStage = 'GENERATED';
+  let statusDisplay = 'Sent to Vendor';
+  if (supervisorScan || dooriRow.status === 'Received' || dooriRow.Material_Received_Date) {
+    currentStage = 'CLOSED';
+    statusDisplay = 'Verified in Warehouse';
+  } else if (gateScan || dooriRow.Gate_Entry_Date) {
+    currentStage = 'AT_GATE';
+    statusDisplay = 'At Gate (Pending Pickup)';
+  }
+
+  const materialName = dooriRow.Style
+    ? `Doori - ${dooriRow.Style} (${dooriRow.Garment_Type || 'Garment'})`
+    : `Doori Lot ${lotNumber}`;
+
+  return {
+    exists: true,
+    docType: 'PO',
+    subType: 'DORI',
+    poNumber,
+    lotNumber,
+    materialName,
+    vendor: dooriRow.Supplier_Name || 'Doori Supplier',
+    supplierName: dooriRow.Supplier_Name || 'Doori Supplier',
+    supervisor: dooriRow.Supervisor || 'Sonu',
+    status: statusDisplay,
+    expectedQuantity: Number(dooriRow.Total_Pieces) || 1,
+    expectedUnit: 'PCS',
+    currentStage,
+    date: dooriRow.Issue_Date || dooriRow.Timestamp || null,
+    isFullyReceived: currentStage === 'CLOSED',
+    isPartialReceived: false,
+    scanHistory: scans,
+    gateInwardScan: gateScan || null,
+    supervisorScan: supervisorScan || null,
+    isOldPo: isOld,
+    isOldDoori: isOld,
+    items: [{
+      name: materialName,
+      qty: Number(dooriRow.Total_Pieces) || 1,
+      unit: 'PCS',
+      department: 'Trim / Stitching',
+    }],
+  };
+}
+
 /**
  * GET /materials/lookup/:lot
  * Universal lookup endpoint for both POs and RGPs.
@@ -293,10 +567,22 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   const digitsOnly = lot.replace(/[^0-9]/g, '');
 
   // =========================================================================
-  // 1. CHECK IF LOOKUP IS AN RGP (Returnable Gate Pass)
+  // 1. CHECK IF LOOKUP IS AN RGP, ZIP, OR DOORI ORDER
   // =========================================================================
   const isExplicitRgp = upperLot.startsWith('RGP') || upperLot.includes('RGP') || req.query.type === 'rgp' || req.query.docType === 'RGP';
+  const isExplicitZip = upperLot.startsWith('ZIP') || upperLot.includes('ZIP') || req.query.type === 'zip' || req.query.subType === 'ZIP';
+  const isExplicitDoori = upperLot.startsWith('DORI') || upperLot.startsWith('DOORI') || upperLot.includes('DORI') || upperLot.includes('DOORI') || req.query.type === 'doori' || req.query.subType === 'DORI';
   const isExplicitPo = upperLot.startsWith('PO-') || upperLot.startsWith('PO');
+
+  if (isExplicitZip) {
+    const zipResult = await lookupZip(upperLot, digitsOnly);
+    if (zipResult) return res.json(zipResult);
+  }
+
+  if (isExplicitDoori) {
+    const dooriResult = await lookupDoori(upperLot, digitsOnly);
+    if (dooriResult) return res.json(dooriResult);
+  }
 
   let pos = [];
   let oldPos = [];
@@ -454,10 +740,25 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   const sup = sups[0] || null;
   const mat = materials[0] || null;
 
-  // Fallback: If no PO / old PO found and not an explicit PO, check RGP and old_rgp tables
-  if (!rawPoRow && !oldPoRow && !sup && !mat && !isExplicitPo) {
-    const fallbackRgp = await lookupRgp(upperLot, digitsOnly);
-    if (fallbackRgp) return res.json(fallbackRgp);
+  // Fallback: If no PO / old PO found, check Zip, Doori, RGP and old tables
+  if (!rawPoRow && !oldPoRow && !sup && !mat) {
+    if (!isExplicitPo) {
+      const fallbackZip = await lookupZip(upperLot, digitsOnly);
+      if (fallbackZip) return res.json(fallbackZip);
+
+      const fallbackDoori = await lookupDoori(upperLot, digitsOnly);
+      if (fallbackDoori) return res.json(fallbackDoori);
+
+      const fallbackRgp = await lookupRgp(upperLot, digitsOnly);
+      if (fallbackRgp) return res.json(fallbackRgp);
+    } else {
+      // Even if lot starts with PO-, if not found in PO, check if it's a Zip or Doori PO
+      const fallbackZip = await lookupZip(upperLot, digitsOnly);
+      if (fallbackZip) return res.json(fallbackZip);
+
+      const fallbackDoori = await lookupDoori(upperLot, digitsOnly);
+      if (fallbackDoori) return res.json(fallbackDoori);
+    }
   }
 
   let po = null;

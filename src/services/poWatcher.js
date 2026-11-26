@@ -27,7 +27,7 @@ async function checkNewPurchaseOrders() {
       const [rows] = await pool.query(`
         SELECT p.id, p.poNumber AS po_number, p.vendorName AS vendor_name,
                p.designName AS design_name, p.designCategory AS design_category,
-               p.items, p.date
+               p.items, p.date, 'PO' AS po_type
         FROM purchase_orders p
         WHERE p.poNumber NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
         ORDER BY p.id ASC
@@ -36,7 +36,42 @@ async function checkNewPurchaseOrders() {
       newPOs = rows;
     } catch (e) {
       console.error('[PO Watcher] Error querying purchase_orders:', e.message);
-      return [];
+    }
+
+    // Also check new Zip orders
+    try {
+      const [zipRows] = await pool.query(`
+        SELECT z.id, COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) AS po_number,
+               z.Supplier_Name AS vendor_name, z.Style AS design_name,
+               'ZIP' AS design_category, z.Total_Pieces AS quantity,
+               z.Issue_Date AS date, z.Supervisor AS supervisor,
+               'ZIP' AS po_type, z.Lot_Number AS lot_number
+        FROM zip z
+        WHERE COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        ORDER BY z.id ASC
+        LIMIT 5
+      `);
+      if (zipRows && zipRows.length) newPOs.push(...zipRows);
+    } catch (e) {
+      console.warn('[PO Watcher] Error querying zip:', e.message);
+    }
+
+    // Also check new Doori orders
+    try {
+      const [dooriRows] = await pool.query(`
+        SELECT d.id, COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) AS po_number,
+               d.Supplier_Name AS vendor_name, d.Style AS design_name,
+               'DORI' AS design_category, d.Total_Pieces AS quantity,
+               d.Issue_Date AS date, d.Supervisor AS supervisor,
+               'DORI' AS po_type, d.Lot_Number AS lot_number
+        FROM doori d
+        WHERE COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        ORDER BY d.id ASC
+        LIMIT 5
+      `);
+      if (dooriRows && dooriRows.length) newPOs.push(...dooriRows);
+    } catch (e) {
+      console.warn('[PO Watcher] Error querying doori:', e.message);
     }
 
     if (!newPOs.length) return [];
@@ -52,14 +87,20 @@ async function checkNewPurchaseOrders() {
     for (const po of newPOs) {
       const rawNum = String(po.po_number || po.id || '').trim();
       const cleanDigits = rawNum.replace(/[^0-9]/g, '') || rawNum;
-      const formattedPo = cleanDigits.startsWith('PO-') ? cleanDigits : `PO-${cleanDigits}`;
-      const vendor = po.vendor_name || 'Vendor';
-      const lotNo = po.design_name || cleanDigits;
+      let formattedPo = cleanDigits.startsWith('PO-') ? cleanDigits : `PO-${cleanDigits}`;
+      if (po.po_type === 'ZIP') {
+        formattedPo = rawNum.startsWith('ZIP-') ? rawNum : `ZIP-${cleanDigits}`;
+      } else if (po.po_type === 'DORI') {
+        formattedPo = (rawNum.startsWith('DORI-') || rawNum.startsWith('DOORI-')) ? rawNum : `DORI-${cleanDigits}`;
+      }
+
+      const vendor = po.vendor_name || (po.po_type === 'ZIP' ? 'Zip Supplier' : (po.po_type === 'DORI' ? 'Doori Supplier' : 'Vendor'));
+      const lotNo = po.lot_number || po.design_name || cleanDigits;
 
       // Parse quantity and items
-      let totalQty = 1;
+      let totalQty = Number(po.quantity) || 1;
       let unit = 'PCS';
-      let itemsSummary = po.design_name || 'Materials';
+      let itemsSummary = po.design_name || (po.po_type === 'ZIP' ? 'Zip Material' : (po.po_type === 'DORI' ? 'Doori Material' : 'Materials'));
 
       if (po.items) {
         try {
@@ -72,24 +113,31 @@ async function checkNewPurchaseOrders() {
         } catch {}
       }
 
-      // Lookup assigned supervisor from supervisor_details_app
-      let assignedSupervisor = null;
-      try {
-        const [supMatch] = await pool.query(
-          "SELECT supervisor FROM supervisor_details_app WHERE lot_number IN (?, ?, ?) LIMIT 1",
-          [cleanDigits, formattedPo, rawNum]
-        );
-        if (supMatch.length && supMatch[0].supervisor) {
-          assignedSupervisor = supMatch[0].supervisor;
-        }
-      } catch {}
+      // Lookup assigned supervisor from supervisor_details_app or PO row
+      let assignedSupervisor = po.supervisor || null;
+      if (!assignedSupervisor) {
+        try {
+          const [supMatch] = await pool.query(
+            "SELECT supervisor FROM supervisor_details_app WHERE lot_number IN (?, ?, ?) LIMIT 1",
+            [cleanDigits, formattedPo, rawNum]
+          );
+          if (supMatch.length && supMatch[0].supervisor) {
+            assignedSupervisor = supMatch[0].supervisor;
+          }
+        } catch {}
+      }
 
       if (!assignedSupervisor) assignedSupervisor = defaultSupName;
 
-      console.log(`[POWatcher] 📋 Detected NEW PO Bill: ${formattedPo} (Vendor: ${vendor}, Lot: ${lotNo}, Supervisor: ${assignedSupervisor}, Qty: ${totalQty} ${unit})`);
+      const poTypeLabel = po.po_type === 'ZIP' ? 'Zip PO' : (po.po_type === 'DORI' ? 'Doori PO' : 'PO');
+      console.log(`[POWatcher] 📋 Detected NEW ${poTypeLabel}: ${formattedPo} (Vendor: ${vendor}, Lot: ${lotNo}, Supervisor: ${assignedSupervisor}, Qty: ${totalQty} ${unit})`);
 
-      const poTitle = `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`;
-      const poBaseMsg = `New PO No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival at gate.`;
+      const poTitle = po.po_type === 'ZIP'
+        ? `📋 New Zip PO: ${formattedPo} Generated | Lot No: ${lotNo}`
+        : (po.po_type === 'DORI'
+            ? `📋 New Doori PO: ${formattedPo} Generated | Lot No: ${lotNo}`
+            : `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`);
+      const poBaseMsg = `New ${poTypeLabel} No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival at gate.`;
 
       // 4. Target Security (Gate), Admin, and ONLY the Specific Assigned Supervisor
       const poTargetUsers = allUsers.filter((u) => {
