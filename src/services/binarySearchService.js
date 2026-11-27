@@ -629,115 +629,139 @@ class BinarySearchService {
 
   /**
    * Fast Binary Lookup for Zip Orders (O(1) & O(log N))
+   * Strictly respects ZIP-PO- / ZIP- series to prevent cross-type or suffix collisions.
    */
   lookupZip(query) {
     if (!query) return null;
     const clean = String(query).trim().toUpperCase();
+    const hasPrefix = clean.startsWith('ZIP') || clean.startsWith('PO-');
     const rawNum = clean.replace(/^ZIP[-/]?/i, '');
-    const cleanZip = `ZIP-${rawNum}`;
+    const cleanZip = clean.startsWith('ZIP') ? clean : `ZIP-${rawNum}`;
     const digits = clean.replace(/[^0-9]/g, '');
 
-    // 1. Direct O(1) exact map lookup
-    const direct = this.zipByExact.get(clean) || this.zipByExact.get(cleanZip) || this.zipByExact.get(rawNum) || (digits ? this.zipByExact.get(digits) : null);
+    // 1. Direct O(1) exact map lookup (do NOT match bare digits if explicit prefix like ZIP-PO-0013 was given)
+    const direct =
+      this.zipByExact.get(clean) ||
+      this.zipByExact.get(cleanZip) ||
+      this.zipByExact.get(rawNum) ||
+      (!hasPrefix && digits ? this.zipByExact.get(digits) : null);
     if (direct) return direct;
 
-    // 2. Binary search on sorted suffix array
-    if (digits && digits.length >= 3) {
+    // 2. Binary search on sorted prefix array for exact poNumber
+    const prefixMatch = this.binarySearchExact(this.zipByPrefix, cleanZip);
+    if (prefixMatch) return prefixMatch;
+
+    // 3. Suffix binary search ONLY for bare numeric queries (e.g. "65031"), never for prefixed POs like "ZIP-PO-0013"
+    if (!hasPrefix && digits && digits.length >= 4) {
       const suffix4 = digits.slice(-4);
       const suffixMatches = this.binarySearchSuffixMatches(this.zipBySuffix, suffix4);
       for (const m of suffixMatches) {
-        if (m.digits === digits || m.digits.endsWith(digits)) return m;
+        if (m.digits === digits) return m;
       }
     }
-
-    // 3. Binary search on sorted prefix array
-    const prefixMatch = this.binarySearchExact(this.zipByPrefix, cleanZip);
-    if (prefixMatch) return prefixMatch;
 
     return null;
   }
 
   /**
    * Fast Binary Lookup for Doori Orders (O(1) & O(log N))
+   * Strictly respects DORI-PO- / DORI- series to prevent cross-type or suffix collisions.
    */
   lookupDoori(query) {
     if (!query) return null;
     const clean = String(query).trim().toUpperCase();
+    const hasPrefix = clean.startsWith('DORI') || clean.startsWith('DOORI') || clean.startsWith('PO-');
     const rawNum = clean.replace(/^(DORI|DOORI)[-/]?/i, '');
-    const cleanDoori = `DORI-${rawNum}`;
+    const cleanDoori = (clean.startsWith('DORI') || clean.startsWith('DOORI')) ? clean : `DORI-${rawNum}`;
     const digits = clean.replace(/[^0-9]/g, '');
 
     // 1. Direct O(1) exact map lookup
-    const direct = this.dooriByExact.get(clean) || this.dooriByExact.get(cleanDoori) || this.dooriByExact.get(rawNum) || (digits ? this.dooriByExact.get(digits) : null);
+    const direct =
+      this.dooriByExact.get(clean) ||
+      this.dooriByExact.get(cleanDoori) ||
+      this.dooriByExact.get(rawNum) ||
+      (!hasPrefix && digits ? this.dooriByExact.get(digits) : null);
     if (direct) return direct;
 
-    // 2. Binary search on sorted suffix array
-    if (digits && digits.length >= 3) {
+    // 2. Binary search on sorted prefix array for exact poNumber
+    const prefixMatch = this.binarySearchExact(this.dooriByPrefix, cleanDoori);
+    if (prefixMatch) return prefixMatch;
+
+    // 3. Suffix binary search ONLY for bare numeric queries
+    if (!hasPrefix && digits && digits.length >= 4) {
       const suffix4 = digits.slice(-4);
       const suffixMatches = this.binarySearchSuffixMatches(this.dooriBySuffix, suffix4);
       for (const m of suffixMatches) {
-        if (m.digits === digits || m.digits.endsWith(digits)) return m;
+        if (m.digits === digits) return m;
       }
     }
-
-    // 3. Binary search on sorted prefix array
-    const prefixMatch = this.binarySearchExact(this.dooriByPrefix, cleanDoori);
-    if (prefixMatch) return prefixMatch;
 
     return null;
   }
 
   /**
    * Fast Binary Lookup for single PO (O(1) & O(log N))
+   * Strictly respects PO- series.
    */
   lookupPo(poNumber) {
     if (!poNumber) return null;
     const clean = String(poNumber).trim().toUpperCase();
-    const cleanPo = clean.startsWith('PO-') ? clean : `PO-${clean}`;
+    const hasPrefix = clean.startsWith('PO-');
+    const cleanPo = hasPrefix ? clean : `PO-${clean}`;
     const rawPo = clean.replace(/^PO-/, '');
     const digits = clean.replace(/[^0-9]/g, '');
 
     // 1. Exact match
-    const match = this.posByExact.get(clean) || this.posByExact.get(cleanPo) || this.posByExact.get(rawPo) || (digits ? this.posByExact.get(digits) : null);
+    const match =
+      this.posByExact.get(clean) ||
+      this.posByExact.get(cleanPo) ||
+      this.posByExact.get(rawPo) ||
+      (!hasPrefix && digits ? this.posByExact.get(digits) : null);
     if (match) return match;
 
-    // 2. Binary search suffix match if 3+ digits
-    if (digits && digits.length >= 3) {
+    // 2. Binary search exact lookup
+    const found = this.binarySearchExact(this.posByPrefix, cleanPo);
+    if (found) return found;
+
+    // 3. Binary search suffix match ONLY for bare numeric queries
+    if (!hasPrefix && digits && digits.length >= 4) {
       const suffix4 = digits.slice(-4);
       const matches = this.binarySearchSuffixMatches(this.posBySuffix, suffix4);
       for (const m of matches) {
-        if (m.digits.endsWith(digits)) return m;
+        if (m.digits === digits) return m;
       }
     }
-
-    // 3. Binary search exact lookup
-    const found = this.binarySearchExact(this.posByPrefix, cleanPo);
-    if (found) return found;
 
     return null;
   }
 
   /**
    * Fast Binary Lookup for single RGP (O(1) & O(log N))
+   * Strictly respects RGP- / RGP/ series.
    */
   lookupRgp(rgpNumber) {
     if (!rgpNumber) return null;
     const clean = String(rgpNumber).trim().toUpperCase();
+    const hasPrefix = clean.startsWith('RGP');
     const rawRgp = clean.replace(/^RGP[-/]?/i, '');
     const slashVariant = `RGP/${rawRgp}`;
     const dashVariant = `RGP-${rawRgp}`;
     const digits = clean.replace(/[^0-9]/g, '');
 
     // 1. Exact match
-    const match = this.rgpsByExact.get(clean) || this.rgpsByExact.get(slashVariant) || this.rgpsByExact.get(dashVariant) || (digits ? this.rgpsByExact.get(digits) : null);
+    const match =
+      this.rgpsByExact.get(clean) ||
+      this.rgpsByExact.get(slashVariant) ||
+      this.rgpsByExact.get(dashVariant) ||
+      (!hasPrefix && digits ? this.rgpsByExact.get(digits) : null);
     if (match) return match;
 
-    // 2. Binary search suffix match if 3+ digits
-    if (digits && digits.length >= 3) {
+    // 2. Binary search suffix match ONLY for bare numeric queries
+    if (!hasPrefix && digits && digits.length >= 4) {
       const suffix4 = digits.slice(-4);
       const matches = this.binarySearchSuffixMatches(this.rgpsBySuffix, suffix4);
       for (const m of matches) {
-        if (m.digits.endsWith(digits)) return m;
+        if (m.digits === digits) return m;
       }
     }
 

@@ -313,16 +313,17 @@ async function lookupZip(upperLot, digitsOnly, fastMatch = null) {
   let zipRow = fastMatch ? fastMatch.data : null;
   let isOld = Boolean(fastMatch ? fastMatch.isOldPo : false);
 
-  // 1. Check live zip table
+  // 1. Check live zip table (only use LIKE suffix when query has no explicit ZIP-/PO- prefix)
+  const isBareNumeric = /^\d+$/.test(upperLot);
   if (!zipRow) {
     try {
       const [z1] = await pool.query(
         `SELECT * FROM zip 
          WHERE po_number IN (?, ?, ?)
             OR Lot_Number IN (?, ?, ?)
-            ${digitsOnly && digitsOnly.length >= 4 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+            ${isBareNumeric && digitsOnly && digitsOnly.length >= 4 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
          ORDER BY id DESC LIMIT 1`,
-        digitsOnly && digitsOnly.length >= 4
+        isBareNumeric && digitsOnly && digitsOnly.length >= 4
           ? [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
           : [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || '']
       );
@@ -454,16 +455,17 @@ async function lookupDoori(upperLot, digitsOnly, fastMatch = null) {
   let dooriRow = fastMatch ? fastMatch.data : null;
   let isOld = Boolean(fastMatch ? fastMatch.isOldPo : false);
 
-  // 1. Check live doori table
+  // 1. Check live doori table (only use LIKE suffix when query has no explicit DORI-/PO- prefix)
+  const isBareNumeric = /^\d+$/.test(upperLot);
   if (!dooriRow) {
     try {
       const [d1] = await pool.query(
         `SELECT * FROM doori 
          WHERE po_number IN (?, ?, ?, ?)
             OR Lot_Number IN (?, ?, ?)
-            ${digitsOnly && digitsOnly.length >= 4 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+            ${isBareNumeric && digitsOnly && digitsOnly.length >= 4 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
          ORDER BY id DESC LIMIT 1`,
-        digitsOnly && digitsOnly.length >= 4
+        isBareNumeric && digitsOnly && digitsOnly.length >= 4
           ? [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
           : [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || '']
       );
