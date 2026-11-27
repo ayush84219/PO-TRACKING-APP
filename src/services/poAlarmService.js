@@ -117,10 +117,14 @@ async function triggerPoAlarm({
   }
 
   const rawPo = String(poNumber).trim();
+  const upperRaw = rawPo.toUpperCase();
   const cleanDigits = rawPo.replace(/[^0-9]/g, '') || rawPo;
-  const formattedPo = rawPo.toUpperCase().startsWith('PO-') ? rawPo.toUpperCase() : `PO-${cleanDigits}`;
-  const displaySupplier = vendorName || 'ABC Traders';
-  const displayAmount = formatPoAmount(amount);
+  const formattedPo = (upperRaw.startsWith('PO-') || upperRaw.startsWith('ZIP-') || upperRaw.startsWith('DORI-') || upperRaw.startsWith('DOORI-'))
+    ? upperRaw
+    : `PO-${cleanDigits}`;
+  const displaySupplier = vendorName || 'Supplier';
+  const displayLotNo = String(lotNo || designName || cleanDigits || formattedPo).trim();
+  const displayAmount = `Lot ${displayLotNo}`;
   const displayTime = formatTimeDisplay(orderDate);
   const nowIso = new Date().toISOString();
 
@@ -198,7 +202,6 @@ async function triggerPoAlarm({
   }
 
   // 4. Construct Notification Details
-  const displayLotNo = String(lotNo || designName || cleanDigits || formattedPo).trim();
   const title = '🚨 NEW PURCHASE ORDER RECEIVED!';
   const supervisorLine = assignedSupervisor ? `\nSupervisor: ${assignedSupervisor}` : '';
   const body = `PO Number: ${formattedPo}\nLot No: ${displayLotNo}\nSupplier: ${displaySupplier}\nTime: ${displayTime}${supervisorLine}`;
@@ -449,7 +452,16 @@ async function getPendingAlarmsForUser(userId) {
        WHERE status IN ('SENT', 'DELIVERED', 'PENDING') AND (expires_at IS NULL OR expires_at > NOW())
        ORDER BY id DESC LIMIT 5`
     );
-    return rows;
+    return rows.map((r) => {
+      const amtStr = String(r.amount || '');
+      const extractedLot = amtStr.startsWith('Lot ') ? amtStr.slice(4).trim() : null;
+      return {
+        ...r,
+        lotNo: extractedLot || r.poNumber,
+        lotNumber: extractedLot || r.poNumber,
+        materialDetails: extractedLot ? `Lot No: ${extractedLot}` : 'PO Material Inward',
+      };
+    });
   } catch (err) {
     console.warn('[POAlarmService] Error fetching pending alarms:', err.message);
     return [];
@@ -543,23 +555,25 @@ async function updateUserNotificationSettings(userId, settings = {}) {
  */
 async function sendTestPoAlarm(userId, userName = 'Tester') {
   const testPoNumber = `PO-TEST-${Math.floor(1000 + Math.random() * 9000)}`;
+  const testLotNo = String(Math.floor(60000 + Math.random() * 9999));
   const displaySupplier = 'ABC Traders (Test Supplier)';
-  const displayAmount = '₹25,000';
+  const displayLotLabel = `Lot ${testLotNo}`;
   const displayTime = formatTimeDisplay(new Date());
   const eventId = `EVT-TEST-ALARM-${Date.now()}`;
   const nowIso = new Date().toISOString();
 
   const title = '🚨 NEW PURCHASE ORDER RECEIVED!';
-  const body = `PO Number: ${testPoNumber}\nSupplier: ${displaySupplier}\nAmount: ${displayAmount}\nTime: ${displayTime}`;
+  const body = `PO Number: ${testPoNumber}\nLot No: ${testLotNo}\nSupplier: ${displaySupplier}\nTime: ${displayTime}`;
 
   const payload = {
     type: 'PO_ALARM',
     eventType: 'PO_ALARM',
     eventId,
     poNumber: testPoNumber,
+    lotNo: testLotNo,
+    lotNumber: testLotNo,
     supplier: displaySupplier,
     vendorName: displaySupplier,
-    amount: displayAmount,
     receivedTime: displayTime,
     timestamp: nowIso,
     channelId: 'po_alarm_channel',
@@ -576,7 +590,7 @@ async function sendTestPoAlarm(userId, userName = 'Tester') {
       `INSERT INTO po_alarm_events_app 
          (event_id, po_number, supplier_name, amount, recipient_user_id, received_at, sent_at, expires_at, status)
        VALUES (?, ?, ?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 60 SECOND), 'SENT')`,
-      [eventId, testPoNumber, displaySupplier, displayAmount, userId]
+      [eventId, testPoNumber, displaySupplier, displayLotLabel, userId]
     );
   } catch { }
 
@@ -592,12 +606,13 @@ async function sendTestPoAlarm(userId, userName = 'Tester') {
       isEmergencyAlarm: true,
       billNumber: testPoNumber,
       poNumber: testPoNumber,
+      lotNo: testLotNo,
+      lotNumber: testLotNo,
       supplierName: displaySupplier,
       vendorName: displaySupplier,
-      amount: displayAmount,
       receivedTime: displayTime,
       designName: 'Sample Goods',
-      materialDetails: 'Industrial Test Materials (500 PCS)',
+      materialDetails: `Lot No: ${testLotNo} • Industrial Test Materials (500 PCS)`,
       source: 'Test Trigger',
       title,
       message: body,
