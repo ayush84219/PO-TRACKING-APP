@@ -229,20 +229,25 @@ async function lookupRgp(upperLot, digitsOnly) {
     } catch {}
   }
 
-  let resolvedSupervisor = (rgp && (rgp.authorizedBy || rgp.authorized_by)) || 'Sanjay';
-  if (itemsList.length > 0) {
+  let resolvedSupervisor = (rgp && (rgp.supervisorName || rgp.supervisor)) || null;
+  if (!resolvedSupervisor && itemsList.length > 0) {
     for (const item of itemsList) {
       if (item.lotNo && item.lotNo !== 'N/A') {
-        const cleanLotNum = item.lotNo.replace(/[^0-9]/g, '');
-        const [supMatch] = await pool.query(
-          'SELECT supervisor FROM supervisor_details_app WHERE lot_number = ? OR lot_number = ? LIMIT 1',
-          [item.lotNo, cleanLotNum]
-        ).catch(() => [[]]);
-        if (supMatch && supMatch.length && supMatch[0].supervisor) {
-          resolvedSupervisor = supMatch[0].supervisor;
+        const lotSup = await resolveLotSupervisor(item.lotNo);
+        if (lotSup) {
+          resolvedSupervisor = lotSup;
           break;
         }
       }
+    }
+  }
+  if (!resolvedSupervisor) {
+    resolvedSupervisor = await resolveLotSupervisor(rgpNumber);
+  }
+  if (!resolvedSupervisor && rgp && (rgp.authorizedBy || rgp.authorized_by)) {
+    const authBy = String(rgp.authorizedBy || rgp.authorized_by).trim();
+    if (authBy && authBy.toLowerCase() !== 'admin') {
+      resolvedSupervisor = authBy;
     }
   }
 
