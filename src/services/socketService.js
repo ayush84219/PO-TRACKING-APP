@@ -57,22 +57,22 @@ function initSocket(httpServer) {
     }
   });
 
-function joinUserRooms(socket, user) {
-  if (!user || user.role === 'guest') return;
-  socket.join(`user:${user.id}`);
-  const role = user.role;
-  if (role === 'gate') {
-    socket.join('gate-notifications');
-  } else if (role === 'store') {
-    socket.join('store-notifications');
-  } else if (role === 'supervisor') {
-    socket.join('supervisor-notifications');
-  } else if (role === 'admin') {
-    // Admin only joins admin-notifications & personal user room (never gate/store/supervisor alarm rooms)
-    socket.join('admin-notifications');
+  function joinUserRooms(socket, user) {
+    if (!user || user.role === 'guest') return;
+    socket.join(`user:${user.id}`);
+    const role = user.role;
+    if (role === 'gate') {
+      socket.join('gate-notifications');
+    } else if (role === 'store') {
+      socket.join('store-notifications');
+    } else if (role === 'supervisor') {
+      socket.join('supervisor-notifications');
+    } else if (role === 'admin') {
+      // Admin only joins admin-notifications & personal user room (never gate/store/supervisor alarm rooms)
+      socket.join('admin-notifications');
+    }
+    console.log(`[Socket] 🟢 Joined rooms for: ${user.name} (Role: ${user.role}, ID: ${user.id}, Socket: ${socket.id})`);
   }
-  console.log(`[Socket] 🟢 Joined rooms for: ${user.name} (Role: ${user.role}, ID: ${user.id}, Socket: ${socket.id})`);
-}
 
   io.on('connection', (socket) => {
     let user = socket.user || { id: 0, name: 'Guest', role: 'guest' };
@@ -138,21 +138,21 @@ function joinUserRooms(socket, user) {
              SET status = 'delivered', delivered_at = NOW(), attempts = attempts + 1, updated_at = NOW() 
              WHERE (event_id = ? OR lot_number = ?) AND (status = 'pending' OR status IS NULL)`,
             [eventId, lotNumber || '']
-          ).catch(() => {});
+          ).catch(() => { });
 
           await pool.query(
             `UPDATE scans_app 
              SET delivery_status = 'delivered', delivered_at = NOW() 
              WHERE (event_id = ? OR lot_number = ?) AND delivery_status = 'pending'`,
             [eventId, lotNumber || '']
-          ).catch(() => {});
+          ).catch(() => { });
         } else if (lotNumber) {
           await pool.query(
             `UPDATE scans_app 
              SET delivery_status = 'delivered', delivered_at = NOW() 
              WHERE lot_number = ? AND delivery_status = 'pending'`,
             [lotNumber]
-          ).catch(() => {});
+          ).catch(() => { });
         }
 
         // Broadcast delivery status to senders (Gate, Store, Admin rooms)
@@ -217,7 +217,7 @@ function joinUserRooms(socket, user) {
           await pool.query(
             `UPDATE notifications_app SET is_read = 1 WHERE lot_number IN (${lotVariants.map(() => '?').join(',')})`,
             lotVariants
-          ).catch(() => {});
+          ).catch(() => { });
         }
 
         const isRgp = rawNum.toUpperCase().includes('RGP');
@@ -341,6 +341,7 @@ function emitToUsers(userIds, eventName, payload) {
 function sendGateScanNotification({
   eventId,
   billNumber,
+  lotNo = null,
   supplierName,
   materialDetails,
   scannerName,
@@ -360,6 +361,8 @@ function sendGateScanNotification({
     eventId,
     eventType: 'MATERIAL_RECEIVED_AT_GATE',
     billNumber,
+    lotNo: lotNo || billNumber,
+    lotNumber: lotNo || billNumber,
     supplierName: supplierName || 'Supplier',
     materialDetails: materialDetails || 'Material Lot',
     scannerName: scannerName || 'Gate Officer',
@@ -394,6 +397,7 @@ function sendGateScanNotification({
 function sendStoreScanNotification({
   eventId,
   billNumber,
+  lotNo = null,
   supplierName,
   materialDetails,
   scannerName,
@@ -413,6 +417,8 @@ function sendStoreScanNotification({
     eventId,
     eventType: 'STORE_SCANNED',
     billNumber,
+    lotNo: lotNo || billNumber,
+    lotNumber: lotNo || billNumber,
     supplierName: supplierName || 'Supplier',
     materialDetails: materialDetails || 'Material Lot',
     scannerName: scannerName || 'Store Person',
@@ -480,7 +486,7 @@ function sendSupervisorScanNotification({
     source: 'Supervisor',
     materialDetails: materialDetails || 'Material Lot',
     title: title || (isClosed ? 'MATERIAL VERIFIED & CLOSED' : 'MATERIAL HALF RECEIVED'),
-    message: message || (isClosed 
+    message: message || (isClosed
       ? `PO ${billNumber} officially CLOSED & verified by Supervisor ${scannerName}.`
       : `PO ${billNumber} partially received by Supervisor ${scannerName}.`),
     status: 'pending',

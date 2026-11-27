@@ -178,6 +178,7 @@ async function checkNewPurchaseOrders() {
       // 5. Trigger Smart PO Alert and Alarm Notification (Uber/Rapido style, OPEN PO & STOP ALARM actions)
       await triggerPoAlarm({
         poNumber: formattedPo,
+        lotNo,
         vendorName: vendor,
         amount: po.total || (po.subtotal ? Number(po.subtotal) + Number(po.tax || 0) : null),
         orderDate: po.date || new Date(),

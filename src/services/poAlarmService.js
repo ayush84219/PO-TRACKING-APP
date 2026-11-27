@@ -98,6 +98,7 @@ async function isPoCancelled(poNumber) {
  */
 async function triggerPoAlarm({
   poNumber,
+  lotNo = null,
   vendorName = 'Supplier / Vendor',
   amount = null,
   orderDate = null,
@@ -197,18 +198,20 @@ async function triggerPoAlarm({
   }
 
   // 4. Construct Notification Details
+  const displayLotNo = String(lotNo || designName || cleanDigits || formattedPo).trim();
   const title = '🚨 NEW PURCHASE ORDER RECEIVED!';
   const supervisorLine = assignedSupervisor ? `\nSupervisor: ${assignedSupervisor}` : '';
-  const body = `PO Number: ${formattedPo}\nSupplier: ${displaySupplier}\nAmount: ${displayAmount}\nTime: ${displayTime}${supervisorLine}`;
+  const body = `PO Number: ${formattedPo}\nLot No: ${displayLotNo}\nSupplier: ${displaySupplier}\nTime: ${displayTime}${supervisorLine}`;
 
   const notificationData = {
     type: 'PO_ALARM',
     eventType: 'PO_ALARM',
     eventId,
     poNumber: formattedPo,
+    lotNo: displayLotNo,
+    lotNumber: displayLotNo,
     supplier: displaySupplier,
     vendorName: displaySupplier,
-    amount: displayAmount,
     receivedTime: displayTime,
     assignedSupervisor: assignedSupervisor || '',
     assignedSupervisorId: String(assignedSupervisorId || ''),
@@ -236,9 +239,10 @@ async function triggerPoAlarm({
       isEmergencyAlarm: true,
       billNumber: formattedPo,
       poNumber: formattedPo,
+      lotNo: displayLotNo,
+      lotNumber: displayLotNo,
       supplierName: displaySupplier,
       vendorName: displaySupplier,
-      amount: displayAmount,
       receivedTime: displayTime,
       designName: designName || '',
       materialDetails: items ? (typeof items === 'string' ? items : JSON.stringify(items)) : 'Materials Inward',

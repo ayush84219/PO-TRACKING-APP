@@ -569,6 +569,7 @@ router.post('/', wrap(async (req, res) => {
       sendGateScanNotification({
         eventId,
         billNumber: docLot,
+        lotNo: lotNumberDisplay,
         supplierName: poVendor,
         materialDetails: materialName || 'RGP Material',
         scannerName: me.name,
@@ -628,6 +629,7 @@ router.post('/', wrap(async (req, res) => {
       sendGateScanNotification({
         eventId,
         billNumber: docLot,
+        lotNo: lotNumberDisplay,
         supplierName: poVendor,
         materialDetails: materialName || 'Material Lot',
         scannerName: me.name,
@@ -695,6 +697,7 @@ router.post('/', wrap(async (req, res) => {
       sendStoreScanNotification({
         eventId,
         billNumber: docLot,
+        lotNo: lotNumberDisplay,
         supplierName: poVendor,
         materialDetails: materialName || 'Material Lot',
         scannerName: me.name,
