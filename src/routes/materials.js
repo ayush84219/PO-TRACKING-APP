@@ -229,25 +229,20 @@ async function lookupRgp(upperLot, digitsOnly) {
     } catch {}
   }
 
-  let resolvedSupervisor = (rgp && (rgp.supervisorName || rgp.supervisor)) || null;
-  if (!resolvedSupervisor && itemsList.length > 0) {
+  let resolvedSupervisor = (rgp && (rgp.authorizedBy || rgp.authorized_by)) || 'Sanjay';
+  if (itemsList.length > 0) {
     for (const item of itemsList) {
       if (item.lotNo && item.lotNo !== 'N/A') {
-        const lotSup = await resolveLotSupervisor(item.lotNo);
-        if (lotSup) {
-          resolvedSupervisor = lotSup;
+        const cleanLotNum = item.lotNo.replace(/[^0-9]/g, '');
+        const [supMatch] = await pool.query(
+          'SELECT supervisor FROM supervisor_details_app WHERE lot_number = ? OR lot_number = ? LIMIT 1',
+          [item.lotNo, cleanLotNum]
+        ).catch(() => [[]]);
+        if (supMatch && supMatch.length && supMatch[0].supervisor) {
+          resolvedSupervisor = supMatch[0].supervisor;
           break;
         }
       }
-    }
-  }
-  if (!resolvedSupervisor) {
-    resolvedSupervisor = await resolveLotSupervisor(rgpNumber);
-  }
-  if (!resolvedSupervisor && rgp && (rgp.authorizedBy || rgp.authorized_by)) {
-    const authBy = String(rgp.authorizedBy || rgp.authorized_by).trim();
-    if (authBy && authBy.toLowerCase() !== 'admin') {
-      resolvedSupervisor = authBy;
     }
   }
 
@@ -325,12 +320,11 @@ async function lookupZip(upperLot, digitsOnly, fastMatch = null) {
         `SELECT * FROM zip 
          WHERE po_number IN (?, ?, ?)
             OR Lot_Number IN (?, ?, ?)
-            OR id = ?
-            ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
-         LIMIT 1`,
-        digitsOnly && digitsOnly.length >= 3
+            ${digitsOnly && digitsOnly.length >= 4 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+         ORDER BY id DESC LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 4
           ? [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
-          : [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
+          : [upperLot, `ZIP-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || '']
       );
       if (z1 && z1.length) zipRow = z1[0];
     } catch (err) {
@@ -338,19 +332,18 @@ async function lookupZip(upperLot, digitsOnly, fastMatch = null) {
     }
   }
 
-  // 2. Check old_zip table
+  // 2. Check old_zip table (never match by auto-increment id to prevent false collisions like ZIP-PO-0012 -> id 12!)
   if (!zipRow) {
     try {
       const [zOld] = await pool.query(
         `SELECT * FROM old_zip 
          WHERE Lot_Number IN (?, ?, ?)
             OR record_key LIKE ?
-            OR id = ?
-            ${digitsOnly && digitsOnly.length >= 3 ? 'OR Lot_Number LIKE ?' : ''}
+            ${digitsOnly && digitsOnly.length >= 4 ? 'OR Lot_Number LIKE ?' : ''}
          ORDER BY id DESC LIMIT 1`,
-        digitsOnly && digitsOnly.length >= 3
-          ? [upperLot, cleanNum, digitsOnly, `%${cleanNum}%`, digitsOnly || -1, `%${digitsOnly}`]
-          : [upperLot, cleanNum, digitsOnly || -1, `%${cleanNum}%`, digitsOnly || -1]
+        digitsOnly && digitsOnly.length >= 4
+          ? [upperLot, cleanNum, digitsOnly, `${cleanNum}__%`, `%${digitsOnly}`]
+          : [upperLot, cleanNum, digitsOnly || '', `${cleanNum}__%`]
       );
       if (zOld && zOld.length) {
         zipRow = zOld[0];
@@ -468,12 +461,11 @@ async function lookupDoori(upperLot, digitsOnly, fastMatch = null) {
         `SELECT * FROM doori 
          WHERE po_number IN (?, ?, ?, ?)
             OR Lot_Number IN (?, ?, ?)
-            OR id = ?
-            ${digitsOnly && digitsOnly.length >= 3 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
-         LIMIT 1`,
-        digitsOnly && digitsOnly.length >= 3
+            ${digitsOnly && digitsOnly.length >= 4 ? 'OR po_number LIKE ? OR Lot_Number LIKE ?' : ''}
+         ORDER BY id DESC LIMIT 1`,
+        digitsOnly && digitsOnly.length >= 4
           ? [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly, `%${digitsOnly}`, `%${digitsOnly}`]
-          : [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || -1]
+          : [upperLot, `DORI-${cleanNum}`, `DOORI-${cleanNum}`, cleanNum, upperLot, cleanNum, digitsOnly || '']
       );
       if (d1 && d1.length) dooriRow = d1[0];
     } catch (err) {
@@ -481,19 +473,18 @@ async function lookupDoori(upperLot, digitsOnly, fastMatch = null) {
     }
   }
 
-  // 2. Check old_doori table
+  // 2. Check old_doori table (never match by auto-increment id to prevent false collisions)
   if (!dooriRow) {
     try {
       const [dOld] = await pool.query(
         `SELECT * FROM old_doori 
          WHERE Lot_Number IN (?, ?, ?)
             OR record_key LIKE ?
-            OR id = ?
-            ${digitsOnly && digitsOnly.length >= 3 ? 'OR Lot_Number LIKE ?' : ''}
+            ${digitsOnly && digitsOnly.length >= 4 ? 'OR Lot_Number LIKE ?' : ''}
          ORDER BY id DESC LIMIT 1`,
-        digitsOnly && digitsOnly.length >= 3
-          ? [upperLot, cleanNum, digitsOnly, `%${cleanNum}%`, digitsOnly || -1, `%${digitsOnly}`]
-          : [upperLot, cleanNum, digitsOnly || -1, `%${cleanNum}%`, digitsOnly || -1]
+        digitsOnly && digitsOnly.length >= 4
+          ? [upperLot, cleanNum, digitsOnly, `${cleanNum}__%`, `%${digitsOnly}`]
+          : [upperLot, cleanNum, digitsOnly || '', `${cleanNum}__%`]
       );
       if (dOld && dOld.length) {
         dooriRow = dOld[0];
@@ -619,20 +610,10 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
   const isExplicitDoori = upperLot.startsWith('DORI') || upperLot.startsWith('DOORI') || upperLot.includes('DORI') || upperLot.includes('DOORI') || req.query.type === 'doori' || req.query.subType === 'DORI';
   const isExplicitPo = upperLot.startsWith('PO-') || upperLot.startsWith('PO');
 
-  if (isExplicitZip) {
-    const zipResult = await lookupZip(upperLot, digitsOnly);
-    if (zipResult) return res.json(zipResult);
-  }
-
-  if (isExplicitDoori) {
-    const dooriResult = await lookupDoori(upperLot, digitsOnly);
-    if (dooriResult) return res.json(dooriResult);
-  }
-
   let pos = [];
   let oldPos = [];
 
-  // Fast-Path: In-memory binary search lookup (O(log N) & O(1) direct map - < 0.1ms)
+  // Fast-Path: In-memory binary search lookup FIRST (O(log N) & O(1) direct map - < 0.1ms)
   if (binarySearchService.isWarmedUp) {
     const hint = isExplicitZip ? 'zip' : (isExplicitDoori ? 'doori' : (isExplicitRgp ? 'rgp' : (req.query.subType || req.query.type || null)));
     const fastMatch = binarySearchService.lookupFast(upperLot, hint);
@@ -654,7 +635,19 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
         }
       }
     }
-  } else if (isExplicitRgp) {
+  }
+
+  if (isExplicitZip) {
+    const zipResult = await lookupZip(upperLot, digitsOnly);
+    if (zipResult) return res.json(zipResult);
+  }
+
+  if (isExplicitDoori) {
+    const dooriResult = await lookupDoori(upperLot, digitsOnly);
+    if (dooriResult) return res.json(dooriResult);
+  }
+
+  if (isExplicitRgp && !binarySearchService.isWarmedUp) {
     const rgpResult = await lookupRgp(upperLot, digitsOnly);
     if (rgpResult) return res.json(rgpResult);
   }
