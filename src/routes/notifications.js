@@ -162,7 +162,7 @@ router.post('/notify-supervisor', wrap(async (req, res) => {
         type: 'MATERIAL_RECEIVED_AT_GATE',
         isReminder: true,
       },
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
   // 3. Update scans_app for this bill with the new eventId & pending delivery status
@@ -171,7 +171,7 @@ router.post('/notify-supervisor', wrap(async (req, res) => {
      SET event_id = ?, delivery_status = 'pending', delivered_at = NULL, acknowledged_at = NULL, acknowledged_by_name = NULL 
      WHERE lot_number = ? OR lot_number = ?`,
     [eventId, cleanLot, cleanLot.replace(/^(PO-|RGP-)/, '')]
-  ).catch(() => {});
+  ).catch(() => { });
 
   // 4. Trigger Real-time Socket.IO notification ONLY to the targeted supervisor user IDs
   const targetUserIds = targets.map(t => t.id);
@@ -388,21 +388,21 @@ router.post('/delivered', wrap(async (req, res) => {
        SET status = 'delivered', delivered_at = NOW(), attempts = attempts + 1, updated_at = NOW() 
        WHERE (event_id = ? OR lot_number = ?) AND (status = 'pending' OR status IS NULL)`,
       [eventId, lotNumber || '']
-    ).catch(() => {});
+    ).catch(() => { });
 
     await pool.query(
       `UPDATE scans_app 
        SET delivery_status = 'delivered', delivered_at = NOW() 
        WHERE (event_id = ? OR lot_number = ?) AND delivery_status = 'pending'`,
       [eventId, lotNumber || '']
-    ).catch(() => {});
+    ).catch(() => { });
   } else if (lotNumber) {
     await pool.query(
       `UPDATE scans_app 
        SET delivery_status = 'delivered', delivered_at = NOW() 
        WHERE lot_number = ? AND delivery_status = 'pending'`,
       [lotNumber]
-    ).catch(() => {});
+    ).catch(() => { });
   }
 
   notifyStatusChange({
@@ -451,14 +451,14 @@ router.post('/acknowledge', wrap(async (req, res) => {
        SET status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by = ?, acknowledged_by_name = ?, updated_at = NOW() 
        WHERE ${whereClause}`,
       [me.id, me.name, ...matchParams]
-    ).catch(() => {});
+    ).catch(() => { });
 
     await pool.query(
       `UPDATE scans_app 
        SET delivery_status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by_name = ? 
        WHERE ${whereClause}`,
       [me.name, ...matchParams]
-    ).catch(() => {});
+    ).catch(() => { });
   } else if (queueId) {
     await acknowledgeById(queueId, me.id, me.name, me.role);
   }
@@ -467,7 +467,7 @@ router.post('/acknowledge', wrap(async (req, res) => {
     await pool.query(
       `UPDATE notifications_app SET is_read = 1 WHERE lot_number IN (${lotVariants.map(() => '?').join(',')})`,
       lotVariants
-    ).catch(() => {});
+    ).catch(() => { });
   }
 
   const isRgp = rawNum.toUpperCase().includes('RGP');
@@ -728,6 +728,107 @@ router.post('/alarm/stop', wrap(async (req, res) => {
     userName: req.user.name,
   });
   res.json(result);
+}));
+
+/**
+ * POST /notifications/alarm/admin-stop
+ * Admin Stop Alarm & Token Control: stops a specific PO alarm (or ALL active alarms),
+ * clears pending notification_queue_app items, marks notified_po_app, and optionally clears fcm_tokens_app.
+ */
+router.post('/alarm/admin-stop', requireRole('admin'), wrap(async (req, res) => {
+  const { poNumber, clearPushTokens = false } = req.body || {};
+  const cleanPo = poNumber ? String(poNumber).trim().toUpperCase() : '';
+  const io = getIO();
+
+  let stoppedAlarms = 0;
+  let clearedQueue = 0;
+  let clearedTokens = 0;
+
+  if (cleanPo) {
+    // Stop specific PO / Lot alarm across all tables & devices
+    await stopPoAlarm({
+      poNumber: cleanPo,
+      userId: req.user.id,
+      userName: req.user.name || 'Admin',
+    });
+
+    const digits = cleanPo.replace(/[^0-9]/g, '');
+    const variants = [...new Set([cleanPo, `PO-${digits}`, `ZIP-${digits}`, `DORI-${digits}`, digits].filter(Boolean))];
+
+    if (variants.length > 0) {
+      const [r1] = await pool.query(
+        `UPDATE po_alarm_events_app
+         SET status = 'STOPPED', stopped_by_user_id = ?, stopped_by_user_name = ?, stopped_at = NOW()
+         WHERE po_number IN (?) AND status IN ('PENDING', 'SENT', 'DELIVERED')`,
+        [req.user.id, req.user.name || 'Admin', variants]
+      ).catch(() => [{ affectedRows: 0 }]);
+      stoppedAlarms = r1.affectedRows || 0;
+
+      const [r2] = await pool.query(
+        `UPDATE notification_queue_app
+         SET status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by_name = ?
+         WHERE lot_number IN (?) AND status IN ('pending', 'delivered')`,
+        [req.user.name || 'Admin', variants]
+      ).catch(() => [{ affectedRows: 0 }]);
+      clearedQueue = r2.affectedRows || 0;
+
+      await pool.query(
+        `INSERT IGNORE INTO notified_po_app (po_number, vendor_name, supervisor_name) VALUES ?`,
+        [variants.map((v) => [v, 'Stopped by Admin', req.user.name || 'Admin'])]
+      ).catch(() => {});
+    }
+
+    if (io) {
+      io.emit('po:alarm_stopped', {
+        poNumber: cleanPo,
+        stoppedByUserId: req.user.id,
+        stoppedByName: req.user.name || 'Admin',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  } else {
+    // Stop ALL active alarms globally
+    const [r1] = await pool.query(
+      `UPDATE po_alarm_events_app
+       SET status = 'STOPPED', stopped_by_user_id = ?, stopped_by_user_name = ?, stopped_at = NOW()
+       WHERE status IN ('PENDING', 'SENT', 'DELIVERED')`,
+      [req.user.id, req.user.name || 'Admin']
+    ).catch(() => [{ affectedRows: 0 }]);
+    stoppedAlarms = r1.affectedRows || 0;
+
+    const [r2] = await pool.query(
+      `UPDATE notification_queue_app
+       SET status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by_name = ?
+       WHERE status IN ('pending', 'delivered')`,
+      [req.user.name || 'Admin']
+    ).catch(() => [{ affectedRows: 0 }]);
+    clearedQueue = r2.affectedRows || 0;
+
+    if (io) {
+      io.emit('po:alarm_stopped', {
+        poNumber: 'ALL',
+        stoppedByUserId: req.user.id,
+        stoppedByName: req.user.name || 'Admin',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  if (clearPushTokens) {
+    const [r3] = await pool.query('DELETE FROM fcm_tokens_app').catch(() => [{ affectedRows: 0 }]);
+    clearedTokens = r3.affectedRows || 0;
+  }
+
+  res.json({
+    ok: true,
+    poNumber: cleanPo || 'ALL',
+    stoppedAlarms,
+    clearedQueue,
+    clearedTokens,
+    message: cleanPo
+      ? `Alarm stopped & muted for ${cleanPo}`
+      : 'All active alarms stopped across all users',
+  });
 }));
 
 /**
