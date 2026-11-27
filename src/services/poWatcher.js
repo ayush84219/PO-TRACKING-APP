@@ -40,16 +40,16 @@ async function checkNewPurchaseOrders() {
       console.error('[PO Watcher] Error querying purchase_orders:', e.message);
     }
 
-    // Also check new Zip orders (skip cancelled)
+    // Also check new Zip orders (skip cancelled; treat empty string po_number as NULL)
     try {
       const [zipRows] = await pool.query(`
-        SELECT z.id, COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) AS po_number,
+        SELECT z.id, COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) AS po_number,
                z.Supplier_Name AS vendor_name, z.Style AS design_name,
                'ZIP' AS design_category, z.Total_Pieces AS quantity,
                z.Issue_Date AS date, z.Supervisor AS supervisor, z.status,
                'ZIP' AS po_type, z.Lot_Number AS lot_number
         FROM zip z
-        WHERE COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        WHERE COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
           AND (z.status IS NULL OR LOWER(z.status) NOT LIKE '%cancel%')
         ORDER BY z.id ASC
         LIMIT 5
@@ -59,16 +59,16 @@ async function checkNewPurchaseOrders() {
       console.warn('[PO Watcher] Error querying zip:', e.message);
     }
 
-    // Also check new Doori orders (skip cancelled)
+    // Also check new Doori orders (skip cancelled; treat empty string po_number as NULL)
     try {
       const [dooriRows] = await pool.query(`
-        SELECT d.id, COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) AS po_number,
+        SELECT d.id, COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) AS po_number,
                d.Supplier_Name AS vendor_name, d.Style AS design_name,
                'DORI' AS design_category, d.Total_Pieces AS quantity,
                d.Issue_Date AS date, d.Supervisor AS supervisor, d.status,
                'DORI' AS po_type, d.Lot_Number AS lot_number
         FROM doori d
-        WHERE COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        WHERE COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
           AND (d.status IS NULL OR LOWER(d.status) NOT LIKE '%cancel%')
         ORDER BY d.id ASC
         LIMIT 5
@@ -278,7 +278,9 @@ async function checkNewPurchaseOrders() {
           timestamp: new Date().toISOString(),
         };
 
-        io.emit('new_notification', socketPayload);
+        if (poTargetIds.length > 0) {
+          emitToUsers(poTargetIds, 'new_notification', socketPayload);
+        }
         io.emit('po:new', {
           poNumber: formattedPo,
           vendorName: vendor,
@@ -287,7 +289,7 @@ async function checkNewPurchaseOrders() {
           totalQty,
           unit,
         });
-        console.log(`[POWatcher] 📡 Socket.IO broadcast sent to all panels for ${formattedPo}`);
+        console.log(`[POWatcher] 📡 Targeted Socket.IO notification sent to user IDs [${poTargetIds.join(', ')}] for ${formattedPo}`);
       }
 
       // 7. Mark PO as notified in notified_po_app
