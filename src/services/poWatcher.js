@@ -2,7 +2,7 @@ const pool = require('../db/pool');
 const { sendPush } = require('./push');
 const { enqueueNotification } = require('./notificationQueue');
 const { getIO, emitToUsers } = require('./socketService');
-const { triggerPoAlarm } = require('./poAlarmService');
+const { triggerPoAlarm, isPoCancelled } = require('./poAlarmService');
 const { resolveSupervisorUsers, getUsersByRole } = require('./userDirectory');
 
 let watcherTimer = null;
@@ -28,9 +28,10 @@ async function checkNewPurchaseOrders() {
       const [rows] = await pool.query(`
         SELECT p.id, p.poNumber AS po_number, p.vendorName AS vendor_name,
                p.designName AS design_name, p.designCategory AS design_category,
-               p.items, p.date, 'PO' AS po_type
+               p.items, p.date, p.status, 'PO' AS po_type
         FROM purchase_orders p
         WHERE p.poNumber NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+          AND (p.status IS NULL OR LOWER(p.status) NOT LIKE '%cancel%')
         ORDER BY p.id ASC
         LIMIT 10
       `);
@@ -39,18 +40,17 @@ async function checkNewPurchaseOrders() {
       console.error('[PO Watcher] Error querying purchase_orders:', e.message);
     }
 
-    // Also check new Zip orders
+    // Also check new Zip orders (skip cancelled)
     try {
       const [zipRows] = await pool.query(`
-        SELECT z.id, COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) AS po_number,
+        SELECT z.id, COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) AS po_number,
                z.Supplier_Name AS vendor_name, z.Style AS design_name,
                'ZIP' AS design_category, z.Total_Pieces AS quantity,
-               z.Issue_Date AS date, z.Supervisor AS supervisor,
+               z.Issue_Date AS date, z.Supervisor AS supervisor, z.status,
                'ZIP' AS po_type, z.Lot_Number AS lot_number
         FROM zip z
-        WHERE COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) IS NOT NULL
-          AND COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) != ''
-          AND COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        WHERE COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+          AND (z.status IS NULL OR LOWER(z.status) NOT LIKE '%cancel%')
         ORDER BY z.id ASC
         LIMIT 5
       `);
@@ -59,18 +59,17 @@ async function checkNewPurchaseOrders() {
       console.warn('[PO Watcher] Error querying zip:', e.message);
     }
 
-    // Also check new Doori orders
+    // Also check new Doori orders (skip cancelled)
     try {
       const [dooriRows] = await pool.query(`
-        SELECT d.id, COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) AS po_number,
+        SELECT d.id, COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) AS po_number,
                d.Supplier_Name AS vendor_name, d.Style AS design_name,
                'DORI' AS design_category, d.Total_Pieces AS quantity,
-               d.Issue_Date AS date, d.Supervisor AS supervisor,
+               d.Issue_Date AS date, d.Supervisor AS supervisor, d.status,
                'DORI' AS po_type, d.Lot_Number AS lot_number
         FROM doori d
-        WHERE COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) IS NOT NULL
-          AND COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) != ''
-          AND COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        WHERE COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+          AND (d.status IS NULL OR LOWER(d.status) NOT LIKE '%cancel%')
         ORDER BY d.id ASC
         LIMIT 5
       `);
@@ -200,7 +199,22 @@ async function checkNewPurchaseOrders() {
       }).catch((err) => console.error('[POWatcher] Error triggering Smart PO Alarm:', err.message));
 
       // 6. Schedule Active Material Alarm 15s after PO generation to alert Security & Supervisor to stay active!
-      setTimeout(() => {
+      setTimeout(async () => {
+        try {
+          if (await isPoCancelled(formattedPo)) {
+            console.log(`[POWatcher] 🚫 Skipping 15s Standby Alarm for cancelled PO: ${formattedPo}`);
+            return;
+          }
+          const [stoppedRows] = await pool.query(
+            `SELECT id FROM po_alarm_events_app WHERE po_number IN (?, ?) AND status = 'STOPPED' LIMIT 1`,
+            [formattedPo, `PO-${cleanDigits}`]
+          ).catch(() => [[]]);
+          if (stoppedRows.length > 0) {
+            console.log(`[POWatcher] 🛑 Skipping 15s Standby Alarm for already-stopped PO: ${formattedPo}`);
+            return;
+          }
+        } catch {}
+
         const standbyAlarmTitle = `🚨 ALARM: Material Standby (PO ${formattedPo})`;
         const standbyAlarmBody = `PO No: ${formattedPo} (Lot ${lotNo}) approaching Gate!\nSupplier: ${vendor} • ${itemsSummary}\nSecurity & Supervisor: Be active for parcel arrival!`;
 
@@ -241,8 +255,9 @@ async function checkNewPurchaseOrders() {
         }
       }, 15000); // 15-second alarm trigger!
 
-      // 6. Broadcast Real-time Normal Notification ONLY to targeted Gate & Assigned Supervisor (never Admin!)
-      if (poTargetIds.length > 0) {
+      // 6. Broadcast Real-time Normal Notification to ALL connected panels via Socket.IO
+      const io = getIO();
+      if (io) {
         const socketPayload = {
           eventId: `EVT-PO-${cleanDigits}-${Date.now()}`,
           eventType: 'PO_GENERATED',
@@ -263,8 +278,8 @@ async function checkNewPurchaseOrders() {
           timestamp: new Date().toISOString(),
         };
 
-        emitToUsers(poTargetIds, 'new_notification', socketPayload);
-        emitToUsers(poTargetIds, 'po:new', {
+        io.emit('new_notification', socketPayload);
+        io.emit('po:new', {
           poNumber: formattedPo,
           vendorName: vendor,
           designName: po.design_name,
@@ -272,7 +287,7 @@ async function checkNewPurchaseOrders() {
           totalQty,
           unit,
         });
-        console.log(`[POWatcher] 📡 Socket.IO targeted notification sent to user IDs [${poTargetIds.join(', ')}] for ${formattedPo}`);
+        console.log(`[POWatcher] 📡 Socket.IO broadcast sent to all panels for ${formattedPo}`);
       }
 
       // 7. Mark PO as notified in notified_po_app

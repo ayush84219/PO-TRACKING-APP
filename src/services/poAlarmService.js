@@ -49,6 +49,50 @@ async function checkAndExpireAlarms() {
 setInterval(checkAndExpireAlarms, 15000);
 
 /**
+ * Check if a PO / Zip / Doori order is Cancelled in the database
+ */
+async function isPoCancelled(poNumber) {
+  if (!poNumber) return false;
+  const raw = String(poNumber).trim().toUpperCase();
+  const digits = raw.replace(/[^0-9]/g, '');
+  const variants = [...new Set([raw, `PO-${digits}`, `ZIP-${digits}`, `DORI-${digits}`, digits].filter(Boolean))];
+
+  try {
+    const [p1] = await pool.query(
+      `SELECT status FROM purchase_orders WHERE poNumber IN (?) AND LOWER(status) LIKE '%cancel%' LIMIT 1`,
+      [variants]
+    );
+    if (p1.length > 0) return true;
+  } catch {}
+
+  try {
+    const [p2] = await pool.query(
+      `SELECT status FROM purchase_orders_app WHERE po_number IN (?) AND LOWER(status) LIKE '%cancel%' LIMIT 1`,
+      [variants]
+    );
+    if (p2.length > 0) return true;
+  } catch {}
+
+  try {
+    const [z1] = await pool.query(
+      `SELECT status FROM zip WHERE (po_number IN (?) OR Lot_Number IN (?)) AND LOWER(status) LIKE '%cancel%' LIMIT 1`,
+      [variants, variants]
+    );
+    if (z1.length > 0) return true;
+  } catch {}
+
+  try {
+    const [d1] = await pool.query(
+      `SELECT status FROM doori WHERE (po_number IN (?) OR Lot_Number IN (?)) AND LOWER(status) LIKE '%cancel%' LIMIT 1`,
+      [variants, variants]
+    );
+    if (d1.length > 0) return true;
+  } catch {}
+
+  return false;
+}
+
+/**
  * Triggers a Smart PO Alert and Alarm Notification
  * Saves status as SENT, expires_at = NOW() + 60s
  */
@@ -64,6 +108,12 @@ async function triggerPoAlarm({
   assignedSupervisorId = null,
 }) {
   if (!poNumber) return null;
+
+  // Never trigger an alarm if this PO is cancelled
+  if (await isPoCancelled(poNumber)) {
+    console.log(`[POAlarmService] 🚫 Skipping alarm for cancelled PO: ${poNumber}`);
+    return { success: false, skipped: true, reason: 'PO is cancelled', poNumber };
+  }
 
   const rawPo = String(poNumber).trim();
   const cleanDigits = rawPo.replace(/[^0-9]/g, '') || rawPo;
@@ -209,7 +259,7 @@ async function triggerPoAlarm({
     eventType: 'PO_ALARM_SENT',
     lotNumber: formattedPo,
     details: { eventId, poNumber: formattedPo, supplier: displaySupplier, amount: displayAmount },
-  }).catch(() => {});
+  }).catch(() => { });
 
   return {
     success: true,
@@ -287,6 +337,35 @@ async function stopPoAlarm({ eventId, poNumber, userId, userName }) {
       params
     );
 
+    // Also acknowledge pending queue items & mark notified_po_app so NO other user or offline device gets this alarm
+    if (poNumber || eventId) {
+      const cleanRaw = poNumber ? String(poNumber).trim().toUpperCase() : '';
+      const digits = cleanRaw.replace(/[^0-9]/g, '');
+      const lotVariants = [...new Set([cleanRaw, `PO-${digits}`, `ZIP-${digits}`, `DORI-${digits}`, digits].filter(Boolean))];
+
+      if (lotVariants.length > 0) {
+        await pool.query(
+          `UPDATE notification_queue_app
+           SET status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by_name = ?
+           WHERE status IN ('pending', 'delivered') AND (lot_number IN (?) OR event_id = ?)`,
+          [userName || 'User', lotVariants, eventId || '']
+        ).catch(() => {});
+
+        await pool.query(
+          `INSERT IGNORE INTO notified_po_app (po_number, vendor_name, supervisor_name)
+           VALUES ?`,
+          [lotVariants.map((v) => [v, 'Stopped/Cancelled', userName || 'System'])]
+        ).catch(() => {});
+      } else if (eventId) {
+        await pool.query(
+          `UPDATE notification_queue_app
+           SET status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by_name = ?
+           WHERE status IN ('pending', 'delivered') AND event_id = ?`,
+          [userName || 'User', eventId]
+        ).catch(() => {});
+      }
+    }
+
     // Broadcast STOP signal to all connected mobile devices
     const io = getIO();
     if (io) {
@@ -306,7 +385,7 @@ async function stopPoAlarm({ eventId, poNumber, userId, userName }) {
       userId,
       userName,
       details: { eventId, poNumber },
-    }).catch(() => {});
+    }).catch(() => { });
 
     return { ok: true, stopped: true, eventId, poNumber, status: 'STOPPED' };
   } catch (err) {
@@ -345,7 +424,7 @@ async function openPoAlarm({ eventId, poNumber, userId, userName }) {
       userId,
       userName,
       details: { eventId, poNumber },
-    }).catch(() => {});
+    }).catch(() => { });
 
     return { ok: true, status: 'OPENED' };
   } catch (err) {
@@ -495,7 +574,7 @@ async function sendTestPoAlarm(userId, userName = 'Tester') {
        VALUES (?, ?, ?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 60 SECOND), 'SENT')`,
       [eventId, testPoNumber, displaySupplier, displayAmount, userId]
     );
-  } catch {}
+  } catch { }
 
   // 1. Send direct FCM push to user
   const pushRes = await sendFcmPush([userId], title, body, payload);
@@ -546,4 +625,5 @@ module.exports = {
   sendTestPoAlarm,
   formatPoAmount,
   formatTimeDisplay,
+  isPoCancelled,
 };
