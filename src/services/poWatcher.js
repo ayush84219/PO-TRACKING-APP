@@ -42,13 +42,15 @@ async function checkNewPurchaseOrders() {
     // Also check new Zip orders
     try {
       const [zipRows] = await pool.query(`
-        SELECT z.id, COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) AS po_number,
+        SELECT z.id, COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) AS po_number,
                z.Supplier_Name AS vendor_name, z.Style AS design_name,
                'ZIP' AS design_category, z.Total_Pieces AS quantity,
                z.Issue_Date AS date, z.Supervisor AS supervisor,
                'ZIP' AS po_type, z.Lot_Number AS lot_number
         FROM zip z
-        WHERE COALESCE(z.po_number, CONCAT('ZIP-', z.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        WHERE COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) IS NOT NULL
+          AND COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) != ''
+          AND COALESCE(NULLIF(TRIM(z.po_number), ''), CONCAT('ZIP-', z.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
         ORDER BY z.id ASC
         LIMIT 5
       `);
@@ -60,13 +62,15 @@ async function checkNewPurchaseOrders() {
     // Also check new Doori orders
     try {
       const [dooriRows] = await pool.query(`
-        SELECT d.id, COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) AS po_number,
+        SELECT d.id, COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) AS po_number,
                d.Supplier_Name AS vendor_name, d.Style AS design_name,
                'DORI' AS design_category, d.Total_Pieces AS quantity,
                d.Issue_Date AS date, d.Supervisor AS supervisor,
                'DORI' AS po_type, d.Lot_Number AS lot_number
         FROM doori d
-        WHERE COALESCE(d.po_number, CONCAT('DORI-', d.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
+        WHERE COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) IS NOT NULL
+          AND COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) != ''
+          AND COALESCE(NULLIF(TRIM(d.po_number), ''), CONCAT('DORI-', d.Lot_Number)) NOT IN (SELECT po_number FROM notified_po_app WHERE po_number IS NOT NULL)
         ORDER BY d.id ASC
         LIMIT 5
       `);
@@ -111,7 +115,7 @@ async function checkNewPurchaseOrders() {
             if (parsed[0].unit) unit = parsed[0].unit;
             itemsSummary = parsed.map(it => it.name).filter(Boolean).slice(0, 3).join(', ') || itemsSummary;
           }
-        } catch {}
+        } catch { }
       }
 
       // Lookup assigned supervisor from supervisor_details_app or PO row
@@ -125,7 +129,7 @@ async function checkNewPurchaseOrders() {
           if (supMatch.length && supMatch[0].supervisor) {
             assignedSupervisor = supMatch[0].supervisor;
           }
-        } catch {}
+        } catch { }
       }
 
       if (!assignedSupervisor) assignedSupervisor = defaultSupName;
@@ -136,8 +140,8 @@ async function checkNewPurchaseOrders() {
       const poTitle = po.po_type === 'ZIP'
         ? `📋 New Zip PO: ${formattedPo} Generated | Lot No: ${lotNo}`
         : (po.po_type === 'DORI'
-            ? `📋 New Doori PO: ${formattedPo} Generated | Lot No: ${lotNo}`
-            : `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`);
+          ? `📋 New Doori PO: ${formattedPo} Generated | Lot No: ${lotNo}`
+          : `📋 New PO No: ${formattedPo} Generated | Lot No: ${lotNo}`);
       const poBaseMsg = `New ${poTypeLabel} No: ${formattedPo} Generated | Lot No: ${lotNo}\nSupplier: ${vendor} • Material: ${itemsSummary} (${totalQty} ${unit})\nAssigned: ${assignedSupervisor}. Standby for arrival at gate.`;
 
       // 4. Target Security (Gate) and ONLY the Specific Assigned Supervisor (NEVER Admin, NEVER other Supervisors)
@@ -180,7 +184,7 @@ async function checkNewPurchaseOrders() {
             type: 'po_generated',
             isEmergencyAlarm: false,
           },
-        }).catch(() => {});
+        }).catch(() => { });
       }
 
       // 5. Trigger Smart PO Alert and Alarm Notification (Uber/Rapido style, OPEN PO & STOP ALARM actions)
@@ -237,9 +241,8 @@ async function checkNewPurchaseOrders() {
         }
       }, 15000); // 15-second alarm trigger!
 
-      // 6. Broadcast Real-time Normal Notification to ALL connected panels via Socket.IO
-      const io = getIO();
-      if (io) {
+      // 6. Broadcast Real-time Normal Notification ONLY to targeted Gate & Assigned Supervisor (never Admin!)
+      if (poTargetIds.length > 0) {
         const socketPayload = {
           eventId: `EVT-PO-${cleanDigits}-${Date.now()}`,
           eventType: 'PO_GENERATED',
@@ -260,8 +263,8 @@ async function checkNewPurchaseOrders() {
           timestamp: new Date().toISOString(),
         };
 
-        io.emit('new_notification', socketPayload);
-        io.emit('po:new', {
+        emitToUsers(poTargetIds, 'new_notification', socketPayload);
+        emitToUsers(poTargetIds, 'po:new', {
           poNumber: formattedPo,
           vendorName: vendor,
           designName: po.design_name,
@@ -269,20 +272,20 @@ async function checkNewPurchaseOrders() {
           totalQty,
           unit,
         });
-        console.log(`[POWatcher] 📡 Socket.IO broadcast sent to all panels for ${formattedPo}`);
+        console.log(`[POWatcher] 📡 Socket.IO targeted notification sent to user IDs [${poTargetIds.join(', ')}] for ${formattedPo}`);
       }
 
       // 7. Mark PO as notified in notified_po_app
       await pool.query(
         `INSERT IGNORE INTO notified_po_app (po_number, vendor_name, supervisor_name) VALUES (?, ?, ?)`,
         [formattedPo, vendor, assignedSupervisor]
-      ).catch(() => {});
+      ).catch(() => { });
 
       if (rawNum !== formattedPo) {
         await pool.query(
           `INSERT IGNORE INTO notified_po_app (po_number, vendor_name, supervisor_name) VALUES (?, ?, ?)`,
           [rawNum, vendor, assignedSupervisor]
-        ).catch(() => {});
+        ).catch(() => { });
       }
 
       detectedPOs.push({ formattedPo, vendor, totalQty, unit });
