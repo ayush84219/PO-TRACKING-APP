@@ -13,7 +13,7 @@ const {
   sendGenericScanNotification,
 } = require('../services/socketService');
 const { binarySearchService } = require('../services/binarySearchService');
-const { getUsersByRole, resolveSupervisorUsers } = require('../services/userDirectory');
+const { getUsersByRole, resolveSupervisorUsers, isSupervisorNameMatch, resolveLotSupervisor } = require('../services/userDirectory');
 
 router.use(authenticate);
 
@@ -349,6 +349,25 @@ router.post('/', wrap(async (req, res) => {
     }
 
     // =========================================================================
+    // 4.5 RESOLVE LOT SUPERVISOR (cutting_header / PO / Zip / Doori) & ENFORCE OWNERSHIP
+    // =========================================================================
+    let preResolvedSupervisor = (req.body.supervisorName || req.body.assignedSupervisor || '').trim() || null;
+    if (!preResolvedSupervisor) {
+      preResolvedSupervisor = await resolveLotSupervisor(docLot, rawLot);
+    }
+
+    if ((isSupervisorScan || me.role === 'supervisor') && preResolvedSupervisor) {
+      if (!isSupervisorNameMatch(me.name, preResolvedSupervisor)) {
+        await conn.rollback();
+        return res.status(403).json({
+          error: `This lot (${docLot}) is assigned to Supervisor ${preResolvedSupervisor}, not ${me.name}. Only ${preResolvedSupervisor} can scan/receive this lot.`,
+          code: 'NOT_LOT_SUPERVISOR',
+          assignedSupervisor: preResolvedSupervisor,
+        });
+      }
+    }
+
+    // =========================================================================
     // 5. INSERT SCAN & UPDATE MATERIAL / PO / RGP STATUS
     // =========================================================================
     let materialId;
@@ -379,12 +398,12 @@ router.post('/', wrap(async (req, res) => {
 
     const defaultNote = isRgp
       ? (scanStage === 'GATE_OUT' ? '[GATE OUT] Dispatched from factory gate' :
-         scanStage === 'GATE_IN' ? (status === 'pending' ? '[GATE IN - PARTIAL] Returned half/partial to factory gate' : '[GATE IN - COMPLETE] Returned complete to factory gate') :
-         (status === 'pending' ? '[SUPERVISOR INWARD - PARTIAL] Half/partial return verified by supervisor' : '[SUPERVISOR INWARD - FINAL] Material verified & RGP closed'))
+        scanStage === 'GATE_IN' ? (status === 'pending' ? '[GATE IN - PARTIAL] Returned half/partial to factory gate' : '[GATE IN - COMPLETE] Returned complete to factory gate') :
+          (status === 'pending' ? '[SUPERVISOR INWARD - PARTIAL] Half/partial return verified by supervisor' : '[SUPERVISOR INWARD - FINAL] Material verified & RGP closed'))
       : (scanStage === 'GATE_INWARD' ? (status === 'pending' ? '[GATE ENTRY - PARTIAL] Half/partial material arrived at gate' : '[GATE ENTRY - COMPLETE] Full material arrived at gate') :
-         scanStage === 'STORE_INWARD' ? `[STORE INWARD] Parcel collected from gate by Store (${me.name})` :
-         scanStage === 'SUPERVISOR_PICKUP' ? (status === 'pending' ? '[SUPERVISOR PICKUP - PARTIAL] Half/partial material verified & received' : '[SUPERVISOR PICKUP - FINAL] Complete material verified & PO Closed') :
-         null);
+        scanStage === 'STORE_INWARD' ? `[STORE INWARD] Parcel collected from gate by Store (${me.name})` :
+          scanStage === 'SUPERVISOR_PICKUP' ? (status === 'pending' ? '[SUPERVISOR PICKUP - PARTIAL] Half/partial material verified & received' : '[SUPERVISOR PICKUP - FINAL] Complete material verified & PO Closed') :
+            null);
 
     eventId = isGateScan
       ? `EVT-GATE-${Date.now()}-${docLot}`
@@ -408,7 +427,7 @@ router.post('/', wrap(async (req, res) => {
         if (poRows[0].vendor_name) poVendor = poRows[0].vendor_name;
         if (poRows[0].design_name) lotNumberDisplay = poRows[0].design_name;
       }
-    } catch {}
+    } catch { }
 
     try {
       const [mainPo] = await conn.query(
@@ -419,7 +438,7 @@ router.post('/', wrap(async (req, res) => {
         if (mainPo[0].vendorName) poVendor = mainPo[0].vendorName;
         if (mainPo[0].designName) lotNumberDisplay = mainPo[0].designName;
       }
-    } catch {}
+    } catch { }
 
     if (lotNumberDisplay === docLot) {
       try {
@@ -431,7 +450,7 @@ router.post('/', wrap(async (req, res) => {
           if (oldPo[0].supplier) poVendor = oldPo[0].supplier;
           if (oldPo[0].lot_no) lotNumberDisplay = oldPo[0].lot_no;
         }
-      } catch {}
+      } catch { }
     }
 
     // Sync PO status in purchase_orders & purchase_orders_app
@@ -450,7 +469,7 @@ router.post('/', wrap(async (req, res) => {
       await conn.query(
         "UPDATE purchase_orders_app SET status = ? WHERE (po_number = ? OR po_number = ?) AND status != 'Cancelled'",
         [poStatus, cleanPo, rawPo]
-      ).catch(() => {});
+      ).catch(() => { });
       // Preserving Project 1 purchase_orders table untouched
     }
 
@@ -462,13 +481,13 @@ router.post('/', wrap(async (req, res) => {
           `UPDATE zip SET Gate_Entry_Person = ?, Gate_Entry_Date = NOW(), status = 'At Gate'
            WHERE po_number IN (?, ?) OR Lot_Number IN (?, ?)`,
           [me.name || 'Gate Security', docLot, `ZIP-${cleanZipNum}`, cleanZipNum, docLot]
-        ).catch(() => {});
+        ).catch(() => { });
       } else if (isSupervisorScan) {
         await conn.query(
           `UPDATE zip SET Material_Received_By = ?, Material_Received_Date = NOW(), status = 'Received'
            WHERE po_number IN (?, ?) OR Lot_Number IN (?, ?)`,
           [me.name || 'Supervisor', docLot, `ZIP-${cleanZipNum}`, cleanZipNum, docLot]
-        ).catch(() => {});
+        ).catch(() => { });
       }
     }
 
@@ -480,13 +499,13 @@ router.post('/', wrap(async (req, res) => {
           `UPDATE doori SET Gate_Entry_Person = ?, Gate_Entry_Date = NOW(), status = 'At Gate'
            WHERE po_number IN (?, ?, ?) OR Lot_Number IN (?, ?)`,
           [me.name || 'Gate Security', docLot, `DORI-${cleanDooriNum}`, `DOORI-${cleanDooriNum}`, cleanDooriNum, docLot]
-        ).catch(() => {});
+        ).catch(() => { });
       } else if (isSupervisorScan) {
         await conn.query(
           `UPDATE doori SET Material_Received_By = ?, Material_Received_Date = NOW(), status = 'Received'
            WHERE po_number IN (?, ?, ?) OR Lot_Number IN (?, ?)`,
           [me.name || 'Supervisor', docLot, `DORI-${cleanDooriNum}`, `DOORI-${cleanDooriNum}`, cleanDooriNum, docLot]
-        ).catch(() => {});
+        ).catch(() => { });
       }
     }
 
@@ -521,8 +540,8 @@ router.post('/', wrap(async (req, res) => {
       details: { scanId, materialId, materialName, status, note, scanStage, rescanned },
     });
 
-    // Lookup Assigned Supervisor for targeted alarm & notification routing (from request, binarySearch index, or DB)
-    let assignedSupervisorName = (req.body.supervisorName || req.body.assignedSupervisor || '').trim() || null;
+    // Lookup Assigned Supervisor for targeted alarm & notification routing (preResolvedSupervisor from cutting_header/PO, binarySearch, or DB)
+    let assignedSupervisorName = preResolvedSupervisor || (req.body.supervisorName || req.body.assignedSupervisor || '').trim() || null;
     if (!assignedSupervisorName && binarySearchService.isWarmedUp) {
       const fastDoc = binarySearchService.lookupFast(docLot);
       if (fastDoc && fastDoc.supervisor) {
@@ -530,16 +549,7 @@ router.post('/', wrap(async (req, res) => {
       }
     }
     if (!assignedSupervisorName) {
-      try {
-        const cleanDigits = docLot.replace(/[^0-9]/g, '');
-        const [supRow] = await pool.query(
-          "SELECT supervisor FROM supervisor_details_app WHERE lot_number IN (?, ?, ?) LIMIT 1",
-          [cleanDigits, docLot, docLot.replace(/^PO-/, '')]
-        );
-        if (supRow.length && supRow[0].supervisor) {
-          assignedSupervisorName = supRow[0].supervisor;
-        }
-      } catch {}
+      assignedSupervisorName = await resolveLotSupervisor(docLot, lotNumberDisplay);
     }
 
     // Resolve ONLY the specific supervisor assigned to this lot via user_details_app (never other supervisors!)
@@ -582,7 +592,7 @@ router.post('/', wrap(async (req, res) => {
           title: notifTitle,
           message: notifMessage,
           payload: { eventId, lotNumber: docLot, materialName, gateOfficerName: me.name, type: 'rgp_gate_out' },
-        }).catch(() => {});
+        }).catch(() => { });
       }
       if (targetIds.length > 0) {
         sendPush(targetIds, notifTitle, notifMessage, { lotNumber: docLot, eventId, type: 'rgp_gate_out', isEmergencyAlarm: true });
@@ -600,11 +610,11 @@ router.post('/', wrap(async (req, res) => {
       const supNote = assignedSupervisorName ? ` | Assigned: ${assignedSupervisorName}` : '';
       const notifMessage = isRgpItem
         ? (isPartial
-            ? `Half return material received in gate (Partial return). RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor})${supNote}. Waiting for balance return.`
-            : `Successfully received return material in gate. RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor})${supNote}. Awaiting supervisor inward.`)
+          ? `Half return material received in gate (Partial return). RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor})${supNote}. Waiting for balance return.`
+          : `Successfully received return material in gate. RGP No: ${docLot} | Scanned by ${me.name}. (Party: ${poVendor})${supNote}. Awaiting supervisor inward.`)
         : (isPartial
-            ? `Half material received in gate (Partial delivery). PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Waiting for remaining delivery.`
-            : `Successfully received material in gate. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Ready for Store collection.`);
+          ? `Half material received in gate (Partial delivery). PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Waiting for remaining delivery.`
+          : `Successfully received material in gate. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Ready for Store collection.`);
 
       const stores = isRgpItem ? [] : await getUsersByRole(['store'], { excludeUserId: me.id });
       const recipientMap = new Map();
@@ -654,7 +664,7 @@ router.post('/', wrap(async (req, res) => {
             type: 'MATERIAL_RECEIVED_AT_GATE',
             source: 'Gate',
           },
-        }).catch(() => {});
+        }).catch(() => { });
       }
 
       if (targetIds.length > 0) {
@@ -720,7 +730,7 @@ router.post('/', wrap(async (req, res) => {
             type: 'STORE_SCANNED',
             source: 'Store',
           },
-        }).catch(() => {});
+        }).catch(() => { });
       }
 
       if (targetIds.length > 0) {
@@ -734,7 +744,7 @@ router.post('/', wrap(async (req, res) => {
 
     } else if (isSupervisorScan || scanStage === 'SUPERVISOR_PICKUP' || scanStage === 'SUPERVISOR_INWARD') {
       // 3. LAST STAGE: Supervisor Received Material -> Notify Gate, Store, AND send clean message to Admin (no alarm)
-      await acknowledgeLot(docLot, me.id, me.name, me.role).catch(() => {});
+      await acknowledgeLot(docLot, me.id, me.name, me.role).catch(() => { });
 
       const isPartialReceipt = status === 'pending';
       const isRgpItem = isRgp || scanStage === 'SUPERVISOR_INWARD';
@@ -742,16 +752,16 @@ router.post('/', wrap(async (req, res) => {
       const pickupTitle = isRgpItem
         ? (isPartialReceipt ? `📦 Supervisor Half Received RGP No: ${docLot}` : `✅ Supervisor Received RGP No: ${docLot}`)
         : (isPartialReceipt
-            ? `📦 Supervisor Half Received PO No: ${docLot}`
-            : `✅ Supervisor Received PO No: ${docLot}`);
+          ? `📦 Supervisor Half Received PO No: ${docLot}`
+          : `✅ Supervisor Received PO No: ${docLot}`);
 
       const pickupMessage = isRgpItem
         ? (isPartialReceipt
-            ? `Supervisor half received RGP No: ${docLot}. Half return material verified by Supervisor ${me.name}. Waiting for balance return.`
-            : `Supervisor received RGP No: ${docLot}. Complete return material verified & RGP officially CLOSED by Supervisor ${me.name}.`)
+          ? `Supervisor half received RGP No: ${docLot}. Half return material verified by Supervisor ${me.name}. Waiting for balance return.`
+          : `Supervisor received RGP No: ${docLot}. Complete return material verified & RGP officially CLOSED by Supervisor ${me.name}.`)
         : (isPartialReceipt
-            ? `Supervisor half received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Half/partial delivery verified & received by Supervisor ${me.name}. Waiting for remaining delivery.`
-            : `Supervisor received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Complete material verified & PO officially CLOSED by Supervisor ${me.name}.`);
+          ? `Supervisor half received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Half/partial delivery verified & received by Supervisor ${me.name}. Waiting for remaining delivery.`
+          : `Supervisor received PO No: ${docLot} | Lot No: ${lotNumberDisplay}. Complete material verified & PO officially CLOSED by Supervisor ${me.name}.`);
 
       const gates = await getUsersByRole(['gate'], { excludeUserId: me.id });
       const stores = await getUsersByRole(['store'], { excludeUserId: me.id });
@@ -803,7 +813,7 @@ router.post('/', wrap(async (req, res) => {
             source: 'Supervisor',
             isEmergencyAlarm: !isAdminTarget,
           },
-        }).catch(() => {});
+        }).catch(() => { });
       }
 
       if (opsTargetIds.length > 0) {
@@ -860,7 +870,7 @@ router.post('/', wrap(async (req, res) => {
             scanId,
             type: 'material_scan',
           },
-        }).catch(() => {});
+        }).catch(() => { });
       }
       if (targetIds.length > 0) {
         sendPush(targetIds, genTitle, genMessage, { lotNumber: docLot, eventId, type: 'scan', isEmergencyAlarm: true });
@@ -873,7 +883,7 @@ router.post('/', wrap(async (req, res) => {
       await pool.query(
         'INSERT INTO notifications_app (user_id, title, message, lot_number) VALUES ?',
         [rescanTargets.map(id => [id, rescanTitle, rescanMsg, docLot])]
-      ).catch(() => {});
+      ).catch(() => { });
       sendPush(rescanTargets, rescanTitle, rescanMsg, { lotNumber: docLot, type: 'rescan' });
     }
 
@@ -911,7 +921,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
        FROM purchase_orders ORDER BY id DESC LIMIT 100`
     );
     pos = p1;
-  } catch {}
+  } catch { }
   if (!pos.length) {
     try {
       const [p2] = await pool.query(
@@ -920,7 +930,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
          FROM purchase_orders_app ORDER BY id DESC LIMIT 100`
       );
       pos = p2;
-    } catch {}
+    } catch { }
   }
 
   let rgps = [];
@@ -964,7 +974,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
               }));
             }
           }
-        } catch {}
+        } catch { }
         if (!entries.length) {
           entries = [{
             lotNo: 'N/A',
@@ -1151,10 +1161,29 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     }
   }
 
+  // Build fast Lot -> Supervisor map from cutting_header so every lot carries its exact supervisor
+  const cuttingSupMap = {};
+  try {
+    const [chRows] = await pool.query(
+      "SELECT Lot_Number, Supervisor FROM cutting_header WHERE Supervisor IS NOT NULL AND TRIM(Supervisor) != ''"
+    );
+    for (const ch of chRows) {
+      if (ch.Lot_Number && ch.Supervisor) {
+        cuttingSupMap[String(ch.Lot_Number).trim().toUpperCase()] = String(ch.Supervisor).trim();
+      }
+    }
+  } catch {}
+
   const poItems = pos.map((po) => {
     const poNum = po.po_number || `PO-${po.id}`;
     const cleanNum = poNum.toUpperCase();
-    const rawNum = cleanNum.replace(/^PO-/, '');
+    const rawNum = cleanNum.replace(/^(PO-|ZIP-|DORI-|DOORI-)/, '');
+    const designKey = String(po.design_name || '').trim().toUpperCase();
+    const resolvedSup = po.supervisor_name
+      || cuttingSupMap[cleanNum]
+      || cuttingSupMap[rawNum]
+      || cuttingSupMap[designKey]
+      || '';
     const lotScans = scansByLot[cleanNum] || scansByLot[rawNum] || [];
 
     const gateInwardScan = lotScans.find(
@@ -1210,7 +1239,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
           totalQty = parsedItems.reduce((acc, it) => acc + (Number(it.qty) || 0), 0);
           if (parsedItems[0] && parsedItems[0].unit) unit = parsedItems[0].unit;
         }
-      } catch {}
+      } catch { }
     }
 
     return {
@@ -1221,8 +1250,8 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       vendor: po.vendor_name || 'Vendor',
       designName: po.design_name || '',
       designCategory: po.design_category || '',
-      supervisor: po.supervisor_name || '',
-      supervisorName: po.supervisor_name || '',
+      supervisor: resolvedSup,
+      supervisorName: resolvedSup,
       requestedBy: po.prepared_by ? `${po.prepared_by}${po.requisition_raised_by ? ` (Requisition: ${po.requisition_raised_by})` : ''}` : (po.requisition_raised_by || ''),
       date: po.date,
       status: statusDisplay,
@@ -1236,49 +1265,49 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       subType: po.subType || 'PO',
       gateInwardScan: gateInwardScan
         ? {
-            officer: gateInwardScan.scannedByName,
-            time: gateInwardScan.createdAt,
-            note: gateInwardScan.note,
-            status: gateInwardScan.status,
-            eventId: gateInwardScan.eventId,
-            deliveryStatus: gateInwardScan.deliveryStatus,
-            deliveredAt: gateInwardScan.deliveredAt,
-            acknowledgedAt: gateInwardScan.acknowledgedAt,
-            acknowledgedByName: gateInwardScan.acknowledgedByName,
-          }
+          officer: gateInwardScan.scannedByName,
+          time: gateInwardScan.createdAt,
+          note: gateInwardScan.note,
+          status: gateInwardScan.status,
+          eventId: gateInwardScan.eventId,
+          deliveryStatus: gateInwardScan.deliveryStatus,
+          deliveredAt: gateInwardScan.deliveredAt,
+          acknowledgedAt: gateInwardScan.acknowledgedAt,
+          acknowledgedByName: gateInwardScan.acknowledgedByName,
+        }
         : (po.gate_person || po.gate_date ? {
-            officer: po.gate_person || 'Gate Security',
-            time: po.gate_date || po.date,
-            note: 'Gate entry recorded in system',
-            status: 'completed',
-          } : null),
+          officer: po.gate_person || 'Gate Security',
+          time: po.gate_date || po.date,
+          note: 'Gate entry recorded in system',
+          status: 'completed',
+        } : null),
       storeScan: storeScan
         ? {
-            officer: storeScan.scannedByName,
-            time: storeScan.createdAt,
-            note: storeScan.note,
-            status: storeScan.status,
-            eventId: storeScan.eventId,
-          }
+          officer: storeScan.scannedByName,
+          time: storeScan.createdAt,
+          note: storeScan.note,
+          status: storeScan.status,
+          eventId: storeScan.eventId,
+        }
         : null,
       supervisorScan: supervisorScan
         ? {
-            officer: supervisorScan.scannedByName,
-            time: supervisorScan.createdAt,
-            note: supervisorScan.note,
-            status: supervisorScan.status,
-            eventId: supervisorScan.eventId,
-            deliveryStatus: supervisorScan.deliveryStatus,
-            deliveredAt: supervisorScan.deliveredAt,
-            acknowledgedAt: supervisorScan.acknowledgedAt,
-            acknowledgedByName: supervisorScan.acknowledgedByName,
-          }
+          officer: supervisorScan.scannedByName,
+          time: supervisorScan.createdAt,
+          note: supervisorScan.note,
+          status: supervisorScan.status,
+          eventId: supervisorScan.eventId,
+          deliveryStatus: supervisorScan.deliveryStatus,
+          deliveredAt: supervisorScan.deliveredAt,
+          acknowledgedAt: supervisorScan.acknowledgedAt,
+          acknowledgedByName: supervisorScan.acknowledgedByName,
+        }
         : (po.received_by || po.received_date ? {
-            officer: po.received_by || po.supervisor_name || 'Supervisor',
-            time: po.received_date,
-            note: 'Material received and verified in warehouse',
-            status: 'completed',
-          } : null),
+          officer: po.received_by || po.supervisor_name || 'Supervisor',
+          time: po.received_date,
+          note: 'Material received and verified in warehouse',
+          status: 'completed',
+        } : null),
       historyCount: lotScans.length,
     };
   });
@@ -1336,7 +1365,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
           totalQty = ents.reduce((acc, it) => acc + (Number(it.qty1) || Number(it.qty2) || 0), 0);
           if (ents[0] && ents[0].uom) unit = ents[0].uom;
         }
-      } catch {}
+      } catch { }
     }
 
     return {
@@ -1361,54 +1390,60 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       itemsCount,
       gateOutScan: gateOutScan
         ? {
-            officer: gateOutScan.scannedByName,
-            time: gateOutScan.createdAt,
-            note: gateOutScan.note,
-            status: gateOutScan.status,
-            eventId: gateOutScan.eventId,
-            deliveryStatus: gateOutScan.deliveryStatus,
-            deliveredAt: gateOutScan.deliveredAt,
-            acknowledgedAt: gateOutScan.acknowledgedAt,
-            acknowledgedByName: gateOutScan.acknowledgedByName,
-          }
+          officer: gateOutScan.scannedByName,
+          time: gateOutScan.createdAt,
+          note: gateOutScan.note,
+          status: gateOutScan.status,
+          eventId: gateOutScan.eventId,
+          deliveryStatus: gateOutScan.deliveryStatus,
+          deliveredAt: gateOutScan.deliveredAt,
+          acknowledgedAt: gateOutScan.acknowledgedAt,
+          acknowledgedByName: gateOutScan.acknowledgedByName,
+        }
         : null,
       gateInScan: gateInScan
         ? {
-            officer: gateInScan.scannedByName,
-            time: gateInScan.createdAt,
-            note: gateInScan.note,
-            status: gateInScan.status,
-            eventId: gateInScan.eventId,
-            deliveryStatus: gateInScan.deliveryStatus,
-            deliveredAt: gateInScan.deliveredAt,
-            acknowledgedAt: gateInScan.acknowledgedAt,
-            acknowledgedByName: gateInScan.acknowledgedByName,
-          }
+          officer: gateInScan.scannedByName,
+          time: gateInScan.createdAt,
+          note: gateInScan.note,
+          status: gateInScan.status,
+          eventId: gateInScan.eventId,
+          deliveryStatus: gateInScan.deliveryStatus,
+          deliveredAt: gateInScan.deliveredAt,
+          acknowledgedAt: gateInScan.acknowledgedAt,
+          acknowledgedByName: gateInScan.acknowledgedByName,
+        }
         : null,
       supervisorScan: supervisorScan
         ? {
-            officer: supervisorScan.scannedByName,
-            time: supervisorScan.createdAt,
-            note: supervisorScan.note,
-            status: supervisorScan.status,
-            eventId: supervisorScan.eventId,
-            deliveryStatus: supervisorScan.deliveryStatus,
-            deliveredAt: supervisorScan.deliveredAt,
-            acknowledgedAt: supervisorScan.acknowledgedAt,
-            acknowledgedByName: supervisorScan.acknowledgedByName,
-          }
+          officer: supervisorScan.scannedByName,
+          time: supervisorScan.createdAt,
+          note: supervisorScan.note,
+          status: supervisorScan.status,
+          eventId: supervisorScan.eventId,
+          deliveryStatus: supervisorScan.deliveryStatus,
+          deliveredAt: supervisorScan.deliveredAt,
+          acknowledgedAt: supervisorScan.acknowledgedAt,
+          acknowledgedByName: supervisorScan.acknowledgedByName,
+        }
         : null,
       historyCount: lotScans.length,
     };
   });
 
+  // If logged-in user is a Supervisor, show ONLY lots assigned to them!
+  const isSupViewer = req.user && req.user.role === 'supervisor';
+  const filteredPoItems = isSupViewer
+    ? poItems.filter((item) => item.supervisorName && isSupervisorNameMatch(req.user.name, item.supervisorName))
+    : poItems;
+
   res.json({
-    pos: poItems,
+    pos: filteredPoItems,
     rgps: rgpItems,
-    totalPos: poItems.length,
+    totalPos: filteredPoItems.length,
     totalRgps: rgpItems.length,
-    activePos: poItems.filter(p => p.currentStage !== 'CLOSED').length,
-    closedPos: poItems.filter(p => p.currentStage === 'CLOSED').length,
+    activePos: filteredPoItems.filter(p => p.currentStage !== 'CLOSED').length,
+    closedPos: filteredPoItems.filter(p => p.currentStage === 'CLOSED').length,
     activeRgps: rgpItems.filter(r => r.currentStage !== 'CLOSED').length,
     closedRgps: rgpItems.filter(r => r.currentStage === 'CLOSED').length,
   });
@@ -1425,8 +1460,8 @@ router.post('/close-po', requireRole('admin'), wrap(async (req, res) => {
   const rawPo = cleanPo.replace(/^PO-/, '');
 
   await pool.query("UPDATE purchase_orders SET status = 'Closed' WHERE poNumber = ? OR poNumber = ?", [cleanPo, rawPo]);
-  await pool.query("UPDATE purchase_orders_app SET status = 'Closed' WHERE po_number = ? OR po_number = ?", [cleanPo, rawPo]).catch(() => {});
-  await pool.query("UPDATE materials_app SET status = 'Closed' WHERE lot_number = ? OR lot_number = ?", [cleanPo, rawPo]).catch(() => {});
+  await pool.query("UPDATE purchase_orders_app SET status = 'Closed' WHERE po_number = ? OR po_number = ?", [cleanPo, rawPo]).catch(() => { });
+  await pool.query("UPDATE materials_app SET status = 'Closed' WHERE lot_number = ? OR lot_number = ?", [cleanPo, rawPo]).catch(() => { });
 
   await logAudit({
     eventType: 'MANUAL_PO_CLOSED',
@@ -1451,7 +1486,7 @@ router.post('/close-rgp', requireRole('admin'), wrap(async (req, res) => {
   const rawRgp = cleanRgp.replace(/^RGP-/, '');
 
   await pool.query("UPDATE rgp SET status = 'Closed' WHERE rgpNo = ? OR rgpNo = ?", [cleanRgp, rawRgp]);
-  await pool.query("UPDATE materials_app SET status = 'Closed' WHERE lot_number = ? OR lot_number = ?", [cleanRgp, rawRgp]).catch(() => {});
+  await pool.query("UPDATE materials_app SET status = 'Closed' WHERE lot_number = ? OR lot_number = ?", [cleanRgp, rawRgp]).catch(() => { });
 
   await logAudit({
     eventType: 'MANUAL_RGP_CLOSED',
@@ -1497,8 +1532,10 @@ router.get('/my', wrap(async (req, res) => {
   const [[stats]] = await pool.query(
     `SELECT COUNT(*) AS total, SUM(status='completed' OR status='Closed') AS completed, SUM(status='in_progress') AS inProgress, SUM(status='pending') AS pending
      FROM scans_app WHERE scanned_by = ?`, [req.user.id]);
-  res.json({ items, page: p, hasMore: items.length === limit,
-    stats: { total: +stats.total, completed: +(stats.completed || 0), inProgress: +(stats.inProgress || 0), pending: +(stats.pending || 0) } });
+  res.json({
+    items, page: p, hasMore: items.length === limit,
+    stats: { total: +stats.total, completed: +(stats.completed || 0), inProgress: +(stats.inProgress || 0), pending: +(stats.pending || 0) }
+  });
 }));
 
 router.get('/', requireRole('admin'), wrap(async (req, res) => {

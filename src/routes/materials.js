@@ -3,8 +3,15 @@ const pool = require('../db/pool');
 const { wrap, AppError } = require('../middleware/errors');
 const { authenticate, requireRole } = require('../middleware/auth');
 const { binarySearchService } = require('../services/binarySearchService');
+const { resolveLotSupervisor, getAllCuttingSupervisors } = require('../services/userDirectory');
 
 router.use(authenticate);
+
+// GET /materials/supervisors - Return all distinct supervisor names from cutting_header & user_details_app
+router.get('/supervisors', wrap(async (req, res) => {
+  const supervisors = await getAllCuttingSupervisors();
+  res.json({ supervisors, count: supervisors.length });
+}));
 
 // Helper: Look up RGP from live rgp and historical old_rgp tables
 async function lookupRgp(upperLot, digitsOnly) {
@@ -1003,6 +1010,9 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
 
     const isPo11021Match = poNumber === 'PO-11021' || rawPo === '11021' || poNumber === 'PO-62115' || rawPo === '62115' || lot === '62115';
     let resolvedSupervisor = (po && (po.supervisor || po.supervisor_name || po.supervisorName)) || (sup ? sup.supervisor : null);
+    if (!resolvedSupervisor) {
+      resolvedSupervisor = await resolveLotSupervisor(poNumber, (po && po.design_name) || lot);
+    }
     if (!resolvedSupervisor && isPo11021Match) {
       resolvedSupervisor = 'EJAJ';
     }

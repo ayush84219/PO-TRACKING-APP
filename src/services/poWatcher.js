@@ -3,7 +3,7 @@ const { sendPush } = require('./push');
 const { enqueueNotification } = require('./notificationQueue');
 const { getIO, emitToUsers } = require('./socketService');
 const { triggerPoAlarm, isPoCancelled } = require('./poAlarmService');
-const { resolveSupervisorUsers, getUsersByRole } = require('./userDirectory');
+const { resolveSupervisorUsers, getUsersByRole, resolveLotSupervisor } = require('./userDirectory');
 
 let watcherTimer = null;
 let isChecking = false;
@@ -117,19 +117,8 @@ async function checkNewPurchaseOrders() {
         } catch { }
       }
 
-      // Lookup assigned supervisor from supervisor_details_app or PO row
-      let assignedSupervisor = po.supervisor || null;
-      if (!assignedSupervisor) {
-        try {
-          const [supMatch] = await pool.query(
-            "SELECT supervisor FROM supervisor_details_app WHERE lot_number IN (?, ?, ?) LIMIT 1",
-            [cleanDigits, formattedPo, rawNum]
-          );
-          if (supMatch.length && supMatch[0].supervisor) {
-            assignedSupervisor = supMatch[0].supervisor;
-          }
-        } catch { }
-      }
+      // Lookup assigned supervisor from PO row, cutting_header, zip/doori, or supervisor_details_app
+      let assignedSupervisor = po.supervisor || await resolveLotSupervisor(formattedPo, lotNo);
 
       if (!assignedSupervisor) assignedSupervisor = defaultSupName;
 
