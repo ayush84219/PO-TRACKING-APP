@@ -351,20 +351,9 @@ router.post('/', wrap(async (req, res) => {
     // =========================================================================
     // 4.5 RESOLVE LOT SUPERVISOR (cutting_header / PO / Zip / Doori) & ENFORCE OWNERSHIP
     // =========================================================================
-    const manualSupervisorInput = (req.body.supervisorName || req.body.assignedSupervisor || '').trim() || null;
-    let preResolvedSupervisor = manualSupervisorInput;
+    let preResolvedSupervisor = (req.body.supervisorName || req.body.assignedSupervisor || '').trim() || null;
     if (!preResolvedSupervisor) {
       preResolvedSupervisor = await resolveLotSupervisor(docLot, rawLot);
-    }
-
-    // If manually entered for an RGP (e.g. Without BOM) or lot without DB supervisor, persist it for subsequent stages
-    if (manualSupervisorInput && docLot) {
-      await conn.query(
-        `INSERT INTO supervisor_details_app (lot_number, supervisor)
-         VALUES (?, ?)
-         ON DUPLICATE KEY UPDATE supervisor = COALESCE(NULLIF(TRIM(supervisor), ''), VALUES(supervisor))`,
-        [docLot, manualSupervisorInput]
-      ).catch(() => {});
     }
 
     if ((isSupervisorScan || me.role === 'supervisor') && preResolvedSupervisor) {
@@ -1175,7 +1164,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     }
   }
 
-  // Build fast Lot -> Supervisor map from cutting_header & supervisor_details_app so every PO & RGP carries its exact supervisor
+  // Build fast Lot -> Supervisor map from cutting_header so every lot carries its exact supervisor
   const cuttingSupMap = {};
   try {
     const [chRows] = await pool.query(
@@ -1184,17 +1173,6 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     for (const ch of chRows) {
       if (ch.Lot_Number && ch.Supervisor) {
         cuttingSupMap[String(ch.Lot_Number).trim().toUpperCase()] = String(ch.Supervisor).trim();
-      }
-    }
-  } catch {}
-  try {
-    const [sdRows] = await pool.query(
-      "SELECT lot_number, supervisor FROM supervisor_details_app WHERE supervisor IS NOT NULL AND TRIM(supervisor) != ''"
-    );
-    for (const sd of sdRows) {
-      if (sd.lot_number && sd.supervisor) {
-        const k = String(sd.lot_number).trim().toUpperCase();
-        if (!cuttingSupMap[k]) cuttingSupMap[k] = String(sd.supervisor).trim();
       }
     }
   } catch {}
@@ -1382,7 +1360,6 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     let totalQty = 0;
     let unit = 'PCS';
     let itemsCount = 0;
-    let rgpSup = cuttingSupMap[cleanRgp] || cuttingSupMap[rawRgp] || '';
     if (rgp.entries) {
       try {
         const ents = typeof rgp.entries === 'string' ? JSON.parse(rgp.entries) : rgp.entries;
@@ -1390,17 +1367,6 @@ router.get('/tracking-summary', wrap(async (req, res) => {
           itemsCount = ents.length;
           totalQty = ents.reduce((acc, it) => acc + (Number(it.qty1) || Number(it.qty2) || 0), 0);
           if (ents[0] && ents[0].uom) unit = ents[0].uom;
-          if (!rgpSup) {
-            for (const it of ents) {
-              if (it.lotNo && it.lotNo !== 'N/A') {
-                const lKey = String(it.lotNo).trim().toUpperCase();
-                if (cuttingSupMap[lKey]) {
-                  rgpSup = cuttingSupMap[lKey];
-                  break;
-                }
-              }
-            }
-          }
         }
       } catch { }
     }
@@ -1414,8 +1380,6 @@ router.get('/tracking-summary', wrap(async (req, res) => {
       purpose: rgp.purpose || 'Job Work',
       department: rgp.department || '',
       vehicleNo: rgp.vehicleNo || '',
-      supervisor: rgpSup,
-      supervisorName: rgpSup,
       date: rgp.date,
       expectedReturnDate: rgp.expectedReturnDate,
       isOldRgp: Boolean(rgp.isOldRgp),
@@ -1470,24 +1434,21 @@ router.get('/tracking-summary', wrap(async (req, res) => {
     };
   });
 
-  // If logged-in user is a Supervisor, show ONLY POs & RGPs assigned to them!
+  // If logged-in user is a Supervisor, show ONLY lots assigned to them!
   const isSupViewer = req.user && req.user.role === 'supervisor';
   const filteredPoItems = isSupViewer
     ? poItems.filter((item) => item.supervisorName && isSupervisorNameMatch(req.user.name, item.supervisorName))
     : poItems;
-  const filteredRgpItems = isSupViewer
-    ? rgpItems.filter((item) => item.supervisorName && isSupervisorNameMatch(req.user.name, item.supervisorName))
-    : rgpItems;
 
   res.json({
     pos: filteredPoItems,
-    rgps: filteredRgpItems,
+    rgps: rgpItems,
     totalPos: filteredPoItems.length,
-    totalRgps: filteredRgpItems.length,
+    totalRgps: rgpItems.length,
     activePos: filteredPoItems.filter(p => p.currentStage !== 'CLOSED').length,
     closedPos: filteredPoItems.filter(p => p.currentStage === 'CLOSED').length,
-    activeRgps: filteredRgpItems.filter(r => r.currentStage !== 'CLOSED').length,
-    closedRgps: filteredRgpItems.filter(r => r.currentStage === 'CLOSED').length,
+    activeRgps: rgpItems.filter(r => r.currentStage !== 'CLOSED').length,
+    closedRgps: rgpItems.filter(r => r.currentStage === 'CLOSED').length,
   });
 }));
 
