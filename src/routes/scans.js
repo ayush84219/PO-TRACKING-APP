@@ -457,7 +457,7 @@ router.post('/', wrap(async (req, res) => {
 
     if (lotNumberDisplay === docLot) {
       try {
-        const [oldPo] = await conn.query(
+        const [oldPo] = await pool.query(
           'SELECT supplier, lot_no FROM old_purchase_orders WHERE po_number = ? OR po_number = ? LIMIT 1',
           [docLot, docLot.replace(/^PO-/, '')]
         );
@@ -467,6 +467,37 @@ router.post('/', wrap(async (req, res) => {
         }
       } catch { }
     }
+
+    // Sync scan to website `scans` table AND `scan_app` table so both website & app stay updated
+    try {
+      const webScanType = (scanStage === 'GATE_OUT')
+        ? 'gate_out'
+        : (isGateScan || scanStage === 'GATE_INWARD' || scanStage === 'GATE_IN')
+          ? 'gate_entry'
+          : (isStoreScan || scanStage === 'STORE_INWARD')
+            ? 'store_entry'
+            : (isSupervisorScan || scanStage === 'SUPERVISOR_PICKUP' || scanStage === 'SUPERVISOR_INWARD')
+              ? 'material_in'
+              : 'scan';
+
+      const moduleType = isRgp ? 'RGP' : (isZip ? 'ZIP' : (isDoori ? 'DORI' : 'PO'));
+      const qtyMatch = (note || '').match(/Qty:\s*(\d+(?:\.\d+)?)/i) || (note || '').match(/(\d+(?:\.\d+)?)\s*(?:PCS|BOX|KG|MTR)/i);
+      const numericQty = qtyMatch ? Number(qtyMatch[1]) : 0;
+      const webMaterialName = materialName || `${moduleType} Material`;
+      const webStatus = (isSupervisorScan && status === 'completed') ? 'Closed' : 'Active';
+
+      await conn.query(
+        `INSERT INTO scans (lot_number, scan_type, person_name, material_name, quantity, supplier_name, scanned_at, status)
+         VALUES (?, ?, ?, ?, ?, ?, NOW(), ?)`,
+        [docLot, webScanType, me.name || 'Staff', webMaterialName, numericQty, poVendor || 'Supplier', webStatus]
+      ).catch(() => { });
+
+      await conn.query(
+        `INSERT INTO scan_app (reference_no, module_type, scan_type, person_name, material_name, quantity, supplier_name, status, scanned_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+        [docLot, moduleType, webScanType, me.name || 'Staff', webMaterialName, numericQty, poVendor || 'Supplier', webStatus]
+      ).catch(() => { });
+    } catch { }
 
     // Sync PO status in purchase_orders & purchase_orders_app
     if (!isRgp && isPoPattern && !isZip && !isDoori) {
