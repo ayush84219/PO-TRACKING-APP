@@ -14,6 +14,7 @@ const {
 } = require('../services/socketService');
 const { binarySearchService } = require('../services/binarySearchService');
 const { getUsersByRole, resolveSupervisorUsers, isSupervisorNameMatch, resolveLotSupervisor } = require('../services/userDirectory');
+const { upsertScannerDetail } = require('../services/scannerDetailsService');
 
 router.use(authenticate);
 
@@ -498,6 +499,28 @@ router.post('/', wrap(async (req, res) => {
         [docLot, moduleType, webScanType, me.name || 'Staff', webMaterialName, numericQty, poVendor || 'Supplier', webStatus]
       ).catch(() => { });
     } catch { }
+
+    // Sync consolidated bill progress to `scanner_details_app` (one row per bill)
+    try {
+      const billType = isRgp ? 'RGP' : (isDoori ? 'DORI_PO' : (isZip ? 'ZIP_PO' : (isPoPattern ? 'PO' : 'OTHER')));
+      const resolvedStage = scanStage || (
+        isGateScan ? (isRgp ? 'GATE_IN' : 'GATE_INWARD') :
+          (isStoreScan ? 'STORE_INWARD' :
+            (isSupervisorScan ? (isRgp ? 'SUPERVISOR_INWARD' : 'SUPERVISOR_PICKUP') : null))
+      );
+      await upsertScannerDetail(conn, {
+        poNo: docLot,
+        billType,
+        materialName: materialName || `${isRgp ? 'RGP' : (isZip ? 'ZIP' : (isDoori ? 'DORI' : 'PO'))} Material`,
+        supplierName: poVendor || 'Supplier',
+        assignedSupervisor: preResolvedSupervisor || null,
+        scanStage: resolvedStage,
+        scannedByName: me.name || 'Staff',
+        isComplete: Boolean(isSupervisorScan && status === 'completed'),
+      });
+    } catch (sdErr) {
+      console.warn('[ScannerDetails] Upsert warning:', sdErr.message);
+    }
 
     // Sync PO status in purchase_orders & purchase_orders_app
     if (!isRgp && isPoPattern && !isZip && !isDoori) {
@@ -1647,10 +1670,45 @@ router.get('/my', wrap(async (req, res) => {
   });
 }));
 
+router.get('/scanner-details', wrap(async (req, res) => {
+  const { limit, offset, page: p } = page(req.query);
+  const where = ['1=1'];
+  const args = [];
+  if (req.query.q) {
+    const q = `%${String(req.query.q).trim().slice(0, 100)}%`;
+    where.push('(po_no LIKE ? OR material_name LIKE ? OR supplier_name LIKE ? OR assigned_supervisor LIKE ?)');
+    args.push(q, q, q, q);
+  }
+  if (req.query.status && ['pending', 'complete'].includes(req.query.status)) {
+    where.push('status = ?');
+    args.push(req.query.status);
+  }
+  if (req.query.billType && ['PO', 'DORI_PO', 'ZIP_PO', 'RGP', 'OTHER'].includes(req.query.billType)) {
+    where.push('bill_type = ?');
+    args.push(req.query.billType);
+  }
+  const [items] = await pool.query(
+    `SELECT id, po_no AS poNo, bill_type AS billType, material_name AS materialName,
+            supplier_name AS supplierName, assigned_supervisor AS assignedSupervisor,
+            gate_out AS gateOut, gate_out_at AS gateOutAt,
+            gate_in AS gateIn, gate_in_at AS gateInAt,
+            store_scan AS storeScan, store_scan_at AS storeScanAt,
+            supervisor_scan AS supervisorScan, supervisor_scan_at AS supervisorScanAt,
+            current_stage AS currentStage, status,
+            created_at AS createdAt, updated_at AS updatedAt
+     FROM scanner_details_app
+     WHERE ${where.join(' AND ')}
+     ORDER BY updated_at DESC, id DESC
+     LIMIT ? OFFSET ?`,
+    [...args, limit, offset]
+  );
+  res.json({ items, page: p, hasMore: items.length === limit });
+}));
+
 router.get('/', requireRole('admin'), wrap(async (req, res) => {
   const { limit, offset, page: p } = page(req.query);
   const where = ['1=1']; const args = [];
-  if (req.query.q) { where.push('s.lot_number LIKE ?'); args.push(`%${String(req.query.q).slice(0, 100)}%`); }
+  if (req.query.q) { where.push('s.bill_no LIKE ?'); args.push(`%${String(req.query.q).slice(0, 100)}%`); }
   if (req.query.status) { where.push('s.status = ?'); args.push(S.status.parse(req.query.status)); }
   if (req.query.userId) { where.push('s.scanned_by = ?'); args.push(parseInt(req.query.userId)); }
   if (req.query.from) { where.push('s.created_at >= ?'); args.push(new Date(req.query.from)); }

@@ -12,7 +12,7 @@ async function initSchema() {
          AND TABLE_NAME IN (
            'user_app', 'materials_app', 'scans_app', 'notifications_app', 
            'refresh_tokens_app', 'purchase_orders_app', 'notification_queue_app', 
-           'audit_logs_app', 'supervisor_details_app', 'material_app', 'users_app', 
+           'audit_logs_app', 'supervisor_details_app', 'scanner_details_app', 'material_app', 'users_app', 
            'scan_app', 'purchase_order_app', 'supervisor_app'
          )`
     );
@@ -551,6 +551,87 @@ async function initSchema() {
         INDEX idx_comp_status (status)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
+
+    // scanner_details_app: Consolidated one-row-per-bill tracking table (PO, Dori PO, Zip PO, RGP)
+    await conn.query(`
+      CREATE TABLE IF NOT EXISTS scanner_details_app (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        po_no VARCHAR(100) NOT NULL UNIQUE,
+        bill_type ENUM('PO','DORI_PO','ZIP_PO','RGP','OTHER') NOT NULL DEFAULT 'PO',
+        material_name VARCHAR(255) NULL,
+        supplier_name VARCHAR(255) NULL,
+        assigned_supervisor VARCHAR(100) NULL,
+        gate_out VARCHAR(255) NULL,
+        gate_out_at DATETIME NULL,
+        gate_in VARCHAR(255) NULL,
+        gate_in_at DATETIME NULL,
+        store_scan VARCHAR(255) NULL,
+        store_scan_at DATETIME NULL,
+        supervisor_scan VARCHAR(255) NULL,
+        supervisor_scan_at DATETIME NULL,
+        current_stage VARCHAR(50) NULL,
+        status ENUM('pending','complete') NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_sd_bill_type (bill_type),
+        INDEX idx_sd_status (status),
+        INDEX idx_sd_updated (updated_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `);
+
+    // Backfill scanner_details_app from existing scans_app history (idempotent)
+    await conn.query(`
+      INSERT INTO scanner_details_app (
+        po_no, bill_type, material_name,
+        gate_out, gate_out_at,
+        gate_in, gate_in_at,
+        store_scan, store_scan_at,
+        supervisor_scan, supervisor_scan_at,
+        current_stage, status
+      )
+      SELECT
+        s.po_no,
+        CASE
+          WHEN s.po_no LIKE 'RGP%' THEN 'RGP'
+          WHEN s.po_no LIKE 'DORI%' OR s.po_no LIKE 'DOORI%' THEN 'DORI_PO'
+          WHEN s.po_no LIKE 'ZIP%' THEN 'ZIP_PO'
+          ELSE 'PO'
+        END AS bill_type,
+        MAX(m.material_name) AS material_name,
+        MAX(CASE WHEN s.po_no LIKE 'RGP%' AND s.scan_stage = 'GATE_OUT' THEN COALESCE(u.name, 'Gate Officer') END) AS gate_out,
+        MAX(CASE WHEN s.po_no LIKE 'RGP%' AND s.scan_stage = 'GATE_OUT' THEN s.created_at END) AS gate_out_at,
+        MAX(CASE WHEN s.scan_stage IN ('GATE_IN', 'GATE_INWARD') THEN COALESCE(u.name, 'Gate Officer') END) AS gate_in,
+        MAX(CASE WHEN s.scan_stage IN ('GATE_IN', 'GATE_INWARD') THEN s.created_at END) AS gate_in_at,
+        MAX(CASE WHEN s.scan_stage = 'STORE_INWARD' THEN COALESCE(u.name, 'Store Officer') END) AS store_scan,
+        MAX(CASE WHEN s.scan_stage = 'STORE_INWARD' THEN s.created_at END) AS store_scan_at,
+        MAX(CASE WHEN s.scan_stage IN ('SUPERVISOR_PICKUP', 'SUPERVISOR_INWARD') THEN COALESCE(u.name, 'Supervisor') END) AS supervisor_scan,
+        MAX(CASE WHEN s.scan_stage IN ('SUPERVISOR_PICKUP', 'SUPERVISOR_INWARD') THEN s.created_at END) AS supervisor_scan_at,
+        SUBSTRING_INDEX(GROUP_CONCAT(s.scan_stage ORDER BY s.id DESC), ',', 1) AS current_stage,
+        CASE
+          WHEN MAX(CASE WHEN s.scan_stage IN ('SUPERVISOR_PICKUP', 'SUPERVISOR_INWARD') AND s.status IN ('completed', 'Closed', 'complete') THEN 1 ELSE 0 END) = 1
+          THEN 'complete'
+          ELSE 'pending'
+        END AS status
+      FROM (
+        SELECT UPPER(TRIM(bill_no)) AS po_no, material_id, scanned_by, scan_stage, status, created_at, id
+        FROM scans_app
+        WHERE bill_no IS NOT NULL AND TRIM(bill_no) != ''
+      ) s
+      LEFT JOIN materials_app m ON m.id = s.material_id
+      LEFT JOIN user_app u ON u.id = s.scanned_by
+      GROUP BY s.po_no
+      ON DUPLICATE KEY UPDATE
+        gate_out = COALESCE(VALUES(gate_out), gate_out),
+        gate_out_at = COALESCE(VALUES(gate_out_at), gate_out_at),
+        gate_in = COALESCE(VALUES(gate_in), gate_in),
+        gate_in_at = COALESCE(VALUES(gate_in_at), gate_in_at),
+        store_scan = COALESCE(VALUES(store_scan), store_scan),
+        store_scan_at = COALESCE(VALUES(store_scan_at), store_scan_at),
+        supervisor_scan = COALESCE(VALUES(supervisor_scan), supervisor_scan),
+        supervisor_scan_at = COALESCE(VALUES(supervisor_scan_at), supervisor_scan_at),
+        current_stage = COALESCE(VALUES(current_stage), current_stage),
+        status = IF(status = 'complete' OR VALUES(status) = 'complete', 'complete', 'pending');
+    `).catch((e) => console.warn('[DB Schema] scanner_details_app backfill warning:', e.message));
 
     console.log('[DB Schema] Dedicated MaterialScan application schema verified successfully (Clean production mode - No demo data).');
   } catch (err) {

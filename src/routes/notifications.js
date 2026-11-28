@@ -16,6 +16,7 @@ const S = require('../validators/schemas');
 const { isFirebaseReady } = require('../services/fcmPush');
 const { resolveSupervisorUsers } = require('../services/userDirectory');
 const { binarySearchService } = require('../services/binarySearchService');
+const { upsertScannerDetail } = require('../services/scannerDetailsService');
 
 /**
  * Public health & FCM readiness diagnostic endpoint
@@ -304,6 +305,15 @@ router.post('/sync', wrap(async (req, res) => {
         'UPDATE materials_app SET status = ?, scan_count = scan_count + 1, last_scanned_by = ?, last_scanned_at = NOW() WHERE id = ?',
         [status, me.id, materialId]
       );
+
+      await upsertScannerDetail(conn, {
+        poNo: lotNumber,
+        materialName: materialName || 'Unnamed material',
+        scanStage: isGateScan ? 'GATE_INWARD' : (isSupervisorScan ? 'SUPERVISOR_PICKUP' : null),
+        scannedByName: me.name || 'Staff',
+        scanTime: scanItem.timestamp ? new Date(scanItem.timestamp) : null,
+        isComplete: Boolean(isSupervisorScan && status === 'completed'),
+      }).catch(() => { });
 
       await conn.commit();
 
