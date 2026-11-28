@@ -516,7 +516,34 @@ router.post('/', wrap(async (req, res) => {
         "UPDATE purchase_orders_app SET status = ? WHERE (po_number = ? OR po_number = ?) AND status != 'Cancelled'",
         [poStatus, cleanPo, rawPo]
       ).catch(() => { });
-      // Preserving Project 1 purchase_orders table untouched
+
+      // Update scanner details & status in purchase_orders table so website/ERP shows scanner info
+      const scanTimeIso = new Date().toISOString();
+      const scannerDisplay = me.name || 'Officer';
+      if (isSupervisorScan) {
+        await conn.query(
+          `UPDATE purchase_orders
+           SET status = ?, material_scanned = ?, material_scanned_at = ?,
+               supervisorName = COALESCE(NULLIF(TRIM(supervisorName), ''), ?),
+               supervisor_name = COALESCE(NULLIF(TRIM(supervisor_name), ''), ?)
+           WHERE (poNumber = ? OR poNumber = ?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
+          [poStatus, scannerDisplay, scanTimeIso, scannerDisplay, scannerDisplay, cleanPo, rawPo]
+        ).catch(() => { });
+      } else if (isStoreScan) {
+        await conn.query(
+          `UPDATE purchase_orders
+           SET status = ?, store_scanned = ?, store_scanned_at = ?
+           WHERE (poNumber = ? OR poNumber = ?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
+          [poStatus, scannerDisplay, scanTimeIso, cleanPo, rawPo]
+        ).catch(() => { });
+      } else if (isGateScan) {
+        await conn.query(
+          `UPDATE purchase_orders
+           SET status = ?, gate_scanned = ?, gate_scanned_at = ?
+           WHERE (poNumber = ? OR poNumber = ?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
+          [poStatus, scannerDisplay, scanTimeIso, cleanPo, rawPo]
+        ).catch(() => { });
+      }
     }
 
     // Sync Zip table status
