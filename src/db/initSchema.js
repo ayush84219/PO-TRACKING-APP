@@ -60,7 +60,7 @@ async function initSchema() {
       CREATE TABLE IF NOT EXISTS scans_app (
         id INT AUTO_INCREMENT PRIMARY KEY,
         material_id INT NOT NULL,
-        lot_number VARCHAR(100) NOT NULL,
+        bill_no VARCHAR(100) NOT NULL,
         scanned_by INT NOT NULL,
         status VARCHAR(50) NOT NULL DEFAULT 'pending',
         scan_stage VARCHAR(50) NULL,
@@ -69,7 +69,7 @@ async function initSchema() {
         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (material_id) REFERENCES materials_app(id) ON DELETE CASCADE,
         FOREIGN KEY (scanned_by) REFERENCES user_app(id) ON DELETE CASCADE,
-        INDEX idx_scans_app_lot (lot_number),
+        INDEX idx_scans_app_bill (bill_no),
         INDEX idx_scans_app_user (scanned_by),
         INDEX idx_scans_app_status (status),
         INDEX idx_scans_app_stage (scan_stage),
@@ -77,15 +77,20 @@ async function initSchema() {
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
 
-    // Ensure scans_app has scan_stage, event_id, delivery_status columns & materials_app status is VARCHAR(50)
+    // Ensure scans_app has bill_no (migrated from lot_number), scan_stage, event_id, delivery_status columns & materials_app status is VARCHAR(50)
     try {
+      const [oldLotCol] = await conn.query("SHOW COLUMNS FROM scans_app LIKE 'lot_number'");
+      const [billNoCol] = await conn.query("SHOW COLUMNS FROM scans_app LIKE 'bill_no'");
+      if (oldLotCol.length && !billNoCol.length) {
+        await conn.query("ALTER TABLE scans_app CHANGE COLUMN lot_number bill_no VARCHAR(100) NOT NULL");
+      }
       const [stageCol] = await conn.query("SHOW COLUMNS FROM scans_app LIKE 'scan_stage'");
       if (!stageCol.length) {
         await conn.query("ALTER TABLE scans_app ADD COLUMN scan_stage VARCHAR(50) NULL AFTER status");
       }
       const [eventIdCol] = await conn.query("SHOW COLUMNS FROM scans_app LIKE 'event_id'");
       if (!eventIdCol.length) {
-        await conn.query("ALTER TABLE scans_app ADD COLUMN event_id VARCHAR(100) NULL AFTER lot_number");
+        await conn.query("ALTER TABLE scans_app ADD COLUMN event_id VARCHAR(100) NULL AFTER bill_no");
       }
       const [delStatusCol] = await conn.query("SHOW COLUMNS FROM scans_app LIKE 'delivery_status'");
       if (!delStatusCol.length) {
@@ -492,7 +497,7 @@ async function initSchema() {
     `).catch(() => {});
 
     // Ensure no legacy demo/mock data remains in MaterialScan app tables (*_app only - never touch shared Project 1 tables)
-    await conn.query("DELETE FROM scans_app WHERE lot_number LIKE 'LOT-%' OR lot_number LIKE 'T-%' OR lot_number LIKE 'N-%' OR lot_number LIKE 'PO-LOT-%' OR lot_number LIKE 'PO-N-%' OR lot_number LIKE 'PO-880%'").catch(() => {});
+    await conn.query("DELETE FROM scans_app WHERE bill_no LIKE 'LOT-%' OR bill_no LIKE 'T-%' OR bill_no LIKE 'N-%' OR bill_no LIKE 'PO-LOT-%' OR bill_no LIKE 'PO-N-%' OR bill_no LIKE 'PO-880%'").catch(() => {});
     await conn.query("DELETE FROM materials_app WHERE lot_number LIKE 'LOT-%' OR lot_number LIKE 'PO-880%' OR lot_number LIKE 'T-%' OR lot_number LIKE 'N-%' OR lot_number LIKE 'PO-LOT-%' OR lot_number LIKE 'PO-N-%'").catch(() => {});
 
     // user_details_app: Master directory storing user ID, name, email, role, base_role, department for ID-based targeted notifications & alarms

@@ -169,7 +169,7 @@ router.post('/notify-supervisor', wrap(async (req, res) => {
   await pool.query(
     `UPDATE scans_app 
      SET event_id = ?, delivery_status = 'pending', delivered_at = NULL, acknowledged_at = NULL, acknowledged_by_name = NULL 
-     WHERE lot_number = ? OR lot_number = ?`,
+     WHERE bill_no = ? OR bill_no = ?`,
     [eventId, cleanLot, cleanLot.replace(/^(PO-|RGP-)/, '')]
   ).catch(() => { });
 
@@ -295,7 +295,7 @@ router.post('/sync', wrap(async (req, res) => {
       }
 
       const [sr] = await conn.query(
-        'INSERT INTO scans_app (material_id, lot_number, scanned_by, status, note, created_at) VALUES (?,?,?,?,?, COALESCE(?, NOW()))',
+        'INSERT INTO scans_app (material_id, bill_no, scanned_by, status, note, created_at) VALUES (?,?,?,?,?, COALESCE(?, NOW()))',
         [materialId, lotNumber, me.id, status, note || null, scanItem.timestamp ? new Date(scanItem.timestamp) : null]
       );
       const scanId = sr.insertId;
@@ -393,14 +393,14 @@ router.post('/delivered', wrap(async (req, res) => {
     await pool.query(
       `UPDATE scans_app 
        SET delivery_status = 'delivered', delivered_at = NOW() 
-       WHERE (event_id = ? OR lot_number = ?) AND delivery_status = 'pending'`,
+       WHERE (event_id = ? OR bill_no = ?) AND delivery_status = 'pending'`,
       [eventId, lotNumber || '']
     ).catch(() => { });
   } else if (lotNumber) {
     await pool.query(
       `UPDATE scans_app 
        SET delivery_status = 'delivered', delivered_at = NOW() 
-       WHERE lot_number = ? AND delivery_status = 'pending'`,
+       WHERE bill_no = ? AND delivery_status = 'pending'`,
       [lotNumber]
     ).catch(() => { });
   }
@@ -453,10 +453,11 @@ router.post('/acknowledge', wrap(async (req, res) => {
       [me.id, me.name, ...matchParams]
     ).catch(() => { });
 
+    const scansWhereClause = whereClause.replace(/lot_number/g, 'bill_no');
     await pool.query(
       `UPDATE scans_app 
        SET delivery_status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by_name = ? 
-       WHERE ${whereClause}`,
+       WHERE ${scansWhereClause}`,
       [me.name, ...matchParams]
     ).catch(() => { });
   } else if (queueId) {

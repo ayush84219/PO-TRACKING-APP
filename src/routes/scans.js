@@ -17,7 +17,7 @@ const { getUsersByRole, resolveSupervisorUsers, isSupervisorNameMatch, resolveLo
 
 router.use(authenticate);
 
-const SELECT = `SELECT s.id, s.lot_number AS lotNumber, COALESCE(m.material_name, 'Material Lot') AS materialName,
+const SELECT = `SELECT s.id, s.bill_no AS lotNumber, COALESCE(m.material_name, 'Material Lot') AS materialName,
   s.status, s.scan_stage AS scanStage, s.note, s.event_id AS eventId,
   s.delivery_status AS deliveryStatus, s.delivered_at AS deliveredAt,
   s.acknowledged_at AS acknowledgedAt, s.acknowledged_by_name AS acknowledgedByName,
@@ -141,7 +141,7 @@ router.post('/', wrap(async (req, res) => {
       const [rgpScans] = await conn.query(
         `SELECT s.id, s.scan_stage, s.status, s.note, s.created_at, u.name AS scannedByName
          FROM scans_app s LEFT JOIN user_app u ON u.id = s.scanned_by
-         WHERE s.lot_number = ? OR s.lot_number = ? ORDER BY s.id ASC`,
+         WHERE s.bill_no = ? OR s.bill_no = ? ORDER BY s.id ASC`,
         [docLot, rawLot]
       );
 
@@ -233,7 +233,7 @@ router.post('/', wrap(async (req, res) => {
       const [allScans] = await conn.query(
         `SELECT s.id, s.scan_stage, s.status, s.note, s.created_at, u.name AS scannedByName
          FROM scans_app s LEFT JOIN user_app u ON u.id = s.scanned_by
-         WHERE (s.lot_number = ? OR s.lot_number = ? OR (s.material_id = ? AND ? > 0))
+         WHERE (s.bill_no = ? OR s.bill_no = ? OR (s.material_id = ? AND ? > 0))
          ORDER BY s.id ASC`,
         [docLot, rawLot, material ? material.id : -1, material ? material.id : -1]
       );
@@ -425,7 +425,7 @@ router.post('/', wrap(async (req, res) => {
       : (isStoreScan ? `EVT-STORE-${Date.now()}-${docLot}` : `EVT-SUP-${Date.now()}-${docLot}`);
 
     const [sr] = await conn.query(
-      'INSERT INTO scans_app (material_id, lot_number, event_id, scanned_by, status, delivery_status, scan_stage, note) VALUES (?,?,?,?,?,?,?,?)',
+      'INSERT INTO scans_app (material_id, bill_no, event_id, scanned_by, status, delivery_status, scan_stage, note) VALUES (?,?,?,?,?,?,?,?)',
       [materialId, docLot, eventId, me.id, status, 'pending', scanStage || null, note || defaultNote]
     );
     scanId = sr.insertId;
@@ -1244,7 +1244,7 @@ router.get('/tracking-summary', wrap(async (req, res) => {
   }
 
   const [allScans] = await pool.query(
-    `SELECT s.id, s.lot_number AS lotNumber, s.scan_stage AS scanStage, s.status, s.note,
+    `SELECT s.id, s.bill_no AS lotNumber, s.scan_stage AS scanStage, s.status, s.note,
             s.event_id AS eventId, s.delivery_status AS deliveryStatus,
             s.delivered_at AS deliveredAt, s.acknowledged_at AS acknowledgedAt,
             s.acknowledged_by_name AS acknowledgedByName,

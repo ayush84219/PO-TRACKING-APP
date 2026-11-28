@@ -154,7 +154,7 @@ async function lookupRgp(upperLot, digitsOnly) {
             s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
      FROM scans_app s
      LEFT JOIN user_app u ON u.id = s.scanned_by
-     WHERE s.lot_number IN (?, ?, ?, ?, ?, ?) OR s.lot_number = ?
+     WHERE s.bill_no IN (?, ?, ?, ?, ?, ?) OR s.bill_no = ?
      ORDER BY s.id ASC`,
     [rgpNumber, cleanRgpDigits, `RGP-${cleanRgpDigits}`, `RGP/${cleanRgpDigits}`, `PO-${cleanRgpDigits}`, cleanRgp, rgp ? rgp.id : -1]
   );
@@ -370,7 +370,7 @@ async function lookupZip(upperLot, digitsOnly, fastMatch = null) {
             s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
      FROM scans_app s
      LEFT JOIN user_app u ON u.id = s.scanned_by
-     WHERE s.lot_number IN (?, ?, ?, ?)
+     WHERE s.bill_no IN (?, ?, ?, ?)
      ORDER BY s.id ASC`,
     [poNumber, lotNumber, cleanDigits, `PO-${cleanDigits}`]
   );
@@ -512,7 +512,7 @@ async function lookupDoori(upperLot, digitsOnly, fastMatch = null) {
             s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
      FROM scans_app s
      LEFT JOIN user_app u ON u.id = s.scanned_by
-     WHERE s.lot_number IN (?, ?, ?, ?)
+     WHERE s.bill_no IN (?, ?, ?, ?)
      ORDER BY s.id ASC`,
     [poNumber, lotNumber, cleanDigits, `PO-${cleanDigits}`]
   );
@@ -874,7 +874,7 @@ router.get('/lookup/:lot', wrap(async (req, res) => {
               s.scanned_by AS scannedById, COALESCE(u.name, 'Officer') AS scannedByName, u.role AS scannedByRole
        FROM scans_app s
        LEFT JOIN user_app u ON u.id = s.scanned_by
-       WHERE s.lot_number IN (?, ?, ?, ?, ?) OR s.material_id = ?
+       WHERE s.bill_no IN (?, ?, ?, ?, ?) OR s.material_id = ?
        ORDER BY s.id ASC`,
       [poNumber, rawPo, lot, cleanPo, digitsOnly || '', mat ? mat.id : -1]
     );

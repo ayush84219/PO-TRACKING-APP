@@ -143,14 +143,14 @@ function initSocket(httpServer) {
           await pool.query(
             `UPDATE scans_app 
              SET delivery_status = 'delivered', delivered_at = NOW() 
-             WHERE (event_id = ? OR lot_number = ?) AND delivery_status = 'pending'`,
+             WHERE (event_id = ? OR bill_no = ?) AND delivery_status = 'pending'`,
             [eventId, lotNumber || '']
           ).catch(() => { });
         } else if (lotNumber) {
           await pool.query(
             `UPDATE scans_app 
              SET delivery_status = 'delivered', delivered_at = NOW() 
-             WHERE lot_number = ? AND delivery_status = 'pending'`,
+             WHERE bill_no = ? AND delivery_status = 'pending'`,
             [lotNumber]
           ).catch(() => { });
         }
@@ -205,10 +205,11 @@ function initSocket(httpServer) {
             [user.id, user.name, ...matchParams]
           ).catch((e) => console.warn('[Socket] Queue ack error:', e.message));
 
+          const scansWhereClause = whereClause.replace(/lot_number/g, 'bill_no');
           await pool.query(
             `UPDATE scans_app 
              SET delivery_status = 'acknowledged', acknowledged_at = NOW(), acknowledged_by_name = ? 
-             WHERE ${whereClause}`,
+             WHERE ${scansWhereClause}`,
             [user.name, ...matchParams]
           ).catch((e) => console.warn('[Socket] Scans ack error:', e.message));
         }

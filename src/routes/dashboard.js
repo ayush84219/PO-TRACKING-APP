@@ -27,7 +27,7 @@ router.get('/summary', authenticate, requireRole('admin'), wrap(async (req, res)
        LIMIT 5`
     ),
     pool.query(
-      `SELECT s.id, s.lot_number AS lotNumber, s.status, s.created_at AS createdAt,
+      `SELECT s.id, s.bill_no AS lotNumber, s.status, s.created_at AS createdAt,
               COALESCE(u.name, 'Gate Officer') AS scannedByName
        FROM scans_app s
        LEFT JOIN user_app u ON u.id = s.scanned_by
