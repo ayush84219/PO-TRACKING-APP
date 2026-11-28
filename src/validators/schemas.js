@@ -19,6 +19,8 @@ module.exports = {
     note: z.string().trim().max(500).optional(),
     scanStage: z.enum(['GATE_INWARD', 'GATE_OUT', 'GATE_IN', 'STORE_INWARD', 'SUPERVISOR_PICKUP', 'SUPERVISOR_INWARD']).optional(),
     docType: z.enum(['PO', 'RGP', 'LOT']).optional(),
+    subType: z.enum(['PO', 'ZIP', 'DORI', 'RGP']).optional(),
+    supervisorName: z.string().trim().max(100).optional(),
   }),
   createUser: z.object({
     name: z.string().trim().min(2).max(100),

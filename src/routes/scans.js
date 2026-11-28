@@ -64,27 +64,42 @@ router.post('/', wrap(async (req, res) => {
   const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
   const upperLot = rawLot.toUpperCase();
-  const isRgp = upperLot.startsWith('RGP-') || upperLot.startsWith('RGP') || parsed.docType === 'RGP';
-  const isZip = upperLot.startsWith('ZIP') || upperLot.includes('ZIP') || parsed.subType === 'ZIP' || parsed.docType === 'ZIP';
-  const isDoori = upperLot.startsWith('DORI') || upperLot.startsWith('DOORI') || upperLot.includes('DORI') || upperLot.includes('DOORI') || parsed.subType === 'DORI' || parsed.docType === 'DORI';
+  let fastDocHint = null;
+  if (binarySearchService.isWarmedUp) {
+    fastDocHint = binarySearchService.lookupFast(upperLot, parsed.subType || parsed.docType || null);
+  }
+
+  const isRgp = upperLot.startsWith('RGP-') || upperLot.startsWith('RGP') || parsed.docType === 'RGP' || (fastDocHint && fastDocHint.docType === 'RGP');
+  const isZip = upperLot.startsWith('ZIP') || upperLot.includes('ZIP') || parsed.subType === 'ZIP' || (fastDocHint && fastDocHint.subType === 'ZIP');
+  const isDoori = upperLot.startsWith('DORI') || upperLot.startsWith('DOORI') || upperLot.includes('DORI') || upperLot.includes('DOORI') || parsed.subType === 'DORI' || (fastDocHint && fastDocHint.subType === 'DORI');
   const isPoPattern = upperLot.startsWith('PO-') || /^\d{4,6}$/.test(rawLot) || parsed.docType === 'PO' || isZip || isDoori;
 
-  // Preserve exact lot string for generic lots, normalize POs, Zip, Doori, and RGPs
+  // Preserve exact canonical PO/RGP series in scans_app.lot_number (e.g. DORI-PO-15002, ZIP-PO-0011, PO-11000, RGP-130002)
   let docLot = rawLot;
   if (isRgp) {
-    docLot = (upperLot.startsWith('RGP-') || upperLot.startsWith('RGP/'))
-      ? upperLot
-      : (upperLot.startsWith('RGP') ? upperLot : `RGP-${upperLot}`);
+    docLot = (fastDocHint && fastDocHint.rgpNumber)
+      ? fastDocHint.rgpNumber
+      : ((upperLot.startsWith('RGP-') || upperLot.startsWith('RGP/'))
+        ? upperLot
+        : (upperLot.startsWith('RGP') ? upperLot : `RGP-${upperLot}`));
   } else if (isZip) {
-    const cleanZip = upperLot.replace(/^ZIP[-/]?/i, '');
-    docLot = upperLot.startsWith('ZIP-') ? upperLot : `ZIP-${cleanZip}`;
+    if (fastDocHint && fastDocHint.poNumber && fastDocHint.poNumber.startsWith('ZIP')) {
+      docLot = fastDocHint.poNumber;
+    } else {
+      const cleanZip = upperLot.replace(/^ZIP[-/]?/i, '');
+      docLot = upperLot.startsWith('ZIP-') ? upperLot : `ZIP-${cleanZip}`;
+    }
   } else if (isDoori) {
-    const cleanDoori = upperLot.replace(/^(DOORI|DORI)[-/]?/i, '');
-    docLot = (upperLot.startsWith('DORI-') || upperLot.startsWith('DOORI-')) ? upperLot : `DORI-${cleanDoori}`;
+    if (fastDocHint && fastDocHint.poNumber && (fastDocHint.poNumber.startsWith('DORI') || fastDocHint.poNumber.startsWith('DOORI'))) {
+      docLot = fastDocHint.poNumber;
+    } else {
+      const cleanDoori = upperLot.replace(/^(DOORI|DORI)[-/]?/i, '');
+      docLot = (upperLot.startsWith('DORI-') || upperLot.startsWith('DOORI-')) ? upperLot : `DORI-${cleanDoori}`;
+    }
   } else if (upperLot.startsWith('PO-')) {
     docLot = upperLot;
   } else if (/^\d{4,6}$/.test(rawLot)) {
-    docLot = `PO-${rawLot}`;
+    docLot = (fastDocHint && fastDocHint.poNumber) ? fastDocHint.poNumber : `PO-${rawLot}`;
   }
 
   const isGateScan = (
