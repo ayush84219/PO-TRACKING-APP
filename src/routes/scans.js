@@ -606,10 +606,15 @@ router.post('/', wrap(async (req, res) => {
     // DISPATCH NOTIFICATIONS FOR ALL SCAN STAGES (FCM + In-App)
     // =========================================================================
     if (scanStage === 'GATE_OUT') {
-      // 1. RGP Stage 1: Gate Out Dispatch (Assigned Supervisor ONLY — NO Admin, NO other Supervisors)
-      const notifTitle = `📤 RGP Material Dispatched (${docLot})`;
-      const notifMessage = `${materialName || 'RGP'} (${docLot}) dispatched through Factory Gate by ${me.name}.`;
-      const targets = targetSups;
+      // 1. RGP Stage 1: Gate Out Dispatch -> Notify Store (+ Assigned Supervisor if set, NO Admin)
+      const notifTitle = `📤 RGP Gate Out Dispatched (${docLot})`;
+      const notifMessage = `${materialName || 'RGP'} (${docLot}) sent out via Factory Gate by ${me.name}.`;
+      const stores = await getUsersByRole(['store'], { excludeUserId: me.id });
+      const gateOutMap = new Map();
+      [...stores, ...targetSups].forEach(u => {
+        if (u.id !== me.id) gateOutMap.set(u.id, u);
+      });
+      const targets = Array.from(gateOutMap.values());
       const targetIds = targets.map(s => s.id);
 
       sendGateScanNotification({
@@ -663,7 +668,8 @@ router.post('/', wrap(async (req, res) => {
           ? `Half material received in gate (Partial delivery). PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Waiting for remaining delivery.`
           : `Successfully received material in gate. PO No: ${docLot} | Lot No: ${lotNumberDisplay} | Scanned by ${me.name}. (Supplier: ${poVendor}, Material: ${materialName || 'Material'})${supNote}. Ready for Store collection.`);
 
-      const stores = isRgpItem ? [] : await getUsersByRole(['store'], { excludeUserId: me.id });
+      // Notify Store AND Assigned Supervisor for both RGP Gate In and PO Gate Inward
+      const stores = await getUsersByRole(['store'], { excludeUserId: me.id });
       const recipientMap = new Map();
       [...stores, ...targetSups].forEach(u => {
         if (u.id !== me.id) recipientMap.set(u.id, u);
