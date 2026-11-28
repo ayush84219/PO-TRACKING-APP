@@ -555,15 +555,44 @@ router.post('/', wrap(async (req, res) => {
       }
     }
 
-    // Sync RGP status in rgp table
+    // Sync RGP status in rgp & old_rgp tables (Gate Out -> Gate In -> Store -> Supervisor Closed)
     if (isRgp) {
       let rgpDbStatus = 'Gate Out';
-      if (scanStage === 'SUPERVISOR_INWARD') {
+      if (scanStage === 'SUPERVISOR_INWARD' || scanStage === 'SUPERVISOR_PICKUP' || isSupervisorScan) {
         rgpDbStatus = (status === 'completed') ? 'Closed' : 'Half Received';
+      } else if (scanStage === 'STORE_INWARD' || isStoreScan) {
+        rgpDbStatus = 'In Store';
       } else if (scanStage === 'GATE_IN') {
         rgpDbStatus = (status === 'pending') ? 'At Gate (Half/Partial Return)' : 'At Gate (Complete Return)';
+      } else if (scanStage === 'GATE_OUT') {
+        rgpDbStatus = 'Gate Out';
       }
-      // Preserving Project 1 rgp table untouched
+
+      const rawRgpDigits = docLot.replace(/^RGP[-/]?/i, '');
+      const rgpVariants = [...new Set([docLot, `RGP-${rawRgpDigits}`, `RGP/${rawRgpDigits}`, rawRgpDigits].filter(Boolean))];
+
+      if (scanStage === 'SUPERVISOR_INWARD' || scanStage === 'SUPERVISOR_PICKUP' || isSupervisorScan) {
+        await conn.query(
+          `UPDATE rgp
+           SET status = ?, supervisor = COALESCE(NULLIF(TRIM(supervisor), ''), ?)
+           WHERE rgpNo IN (?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
+          [rgpDbStatus, me.name || 'Supervisor', rgpVariants]
+        ).catch(() => { });
+      } else {
+        await conn.query(
+          `UPDATE rgp
+           SET status = ?
+           WHERE rgpNo IN (?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
+          [rgpDbStatus, rgpVariants]
+        ).catch(() => { });
+      }
+
+      await conn.query(
+        `UPDATE old_rgp
+         SET status = ?
+         WHERE rgp_no IN (?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
+        [rgpDbStatus, rgpVariants]
+      ).catch(() => { });
     }
 
     await conn.commit();
