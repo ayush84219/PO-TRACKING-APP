@@ -517,31 +517,29 @@ router.post('/', wrap(async (req, res) => {
         [poStatus, cleanPo, rawPo]
       ).catch(() => { });
 
-      // Update scanner details & status in purchase_orders table so website/ERP shows scanner info
-      const scanTimeIso = new Date().toISOString();
-      const scannerDisplay = me.name || 'Officer';
+      // Update purchase_orders scanner columns (gate_scanned, store_scanned, material_scanned) & status
+      const nowStr = new Date().toISOString();
+      const scannerName = me.name || 'Staff';
       if (isSupervisorScan) {
         await conn.query(
           `UPDATE purchase_orders
-           SET status = ?, material_scanned = ?, material_scanned_at = ?,
-               supervisorName = COALESCE(NULLIF(TRIM(supervisorName), ''), ?),
-               supervisor_name = COALESCE(NULLIF(TRIM(supervisor_name), ''), ?)
+           SET status = ?, material_scanned = ?, material_scanned_at = ?
            WHERE (poNumber = ? OR poNumber = ?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
-          [poStatus, scannerDisplay, scanTimeIso, scannerDisplay, scannerDisplay, cleanPo, rawPo]
+          [poStatus, scannerName, nowStr, cleanPo, rawPo]
         ).catch(() => { });
       } else if (isStoreScan) {
         await conn.query(
           `UPDATE purchase_orders
            SET status = ?, store_scanned = ?, store_scanned_at = ?
            WHERE (poNumber = ? OR poNumber = ?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
-          [poStatus, scannerDisplay, scanTimeIso, cleanPo, rawPo]
+          [poStatus, scannerName, nowStr, cleanPo, rawPo]
         ).catch(() => { });
       } else if (isGateScan) {
         await conn.query(
           `UPDATE purchase_orders
            SET status = ?, gate_scanned = ?, gate_scanned_at = ?
            WHERE (poNumber = ? OR poNumber = ?) AND LOWER(COALESCE(status, '')) NOT LIKE '%cancel%'`,
-          [poStatus, scannerDisplay, scanTimeIso, cleanPo, rawPo]
+          [poStatus, scannerName, nowStr, cleanPo, rawPo]
         ).catch(() => { });
       }
     }
